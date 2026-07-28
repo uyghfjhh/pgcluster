@@ -92,21 +92,31 @@ class Manager:
 
     def graph(self, target):
         order = self.config.closure(target)
-        lines = ["CLUSTER %s [%s]" % (target, self.config.cluster(target)["type"])]
-        for name in order:
+        root = self.config.cluster(target)
+        lines = ["CLUSTER %s [%s]" % (target, root["type"])]
+
+        def streaming_lines(name, prefix="", last=True, include_name=True):
             cluster = self.config.cluster(name)
-            if cluster["type"] == "streaming":
-                lines.append("├── %s [streaming]" % name)
-                lines.append("│   ├── primary: %s" % cluster["primary"])
-                for standby in cluster.get("standbys") or []:
-                    lines.append("│   └── standby: %s (slot: %s)" %
-                                 (standby["node"], self.config.physical_slot(name, standby)))
-            elif cluster["type"] == "logical":
-                names = self.config.logical_names(name)
-                lines.append("└── %s [logical]" % name)
-                lines.append("    ├── publisher: %s" % cluster["publisher"])
-                lines.append("    ├── subscriber: %s" % cluster["subscriber"])
-                lines.append("    └── slot: %s" % names["slot"])
+            if include_name:
+                branch = "└──" if last else "├──"
+                lines.append("%s%s %s [streaming]" % (prefix, branch, name))
+                prefix += "    " if last else "│   "
+            members = [("primary", cluster["primary"])]
+            members.extend(("standby", standby["node"]) for standby in cluster.get("standbys") or [])
+            for index, (role, node) in enumerate(members):
+                node_last = index == len(members) - 1
+                branch = "└──" if node_last else "├──"
+                suffix = ""
+                if role == "standby":
+                    standby = (cluster.get("standbys") or [])[index - 1]
+                    suffix = " (slot: %s)" % self.config.physical_slot(name, standby)
+                lines.append("%s%s %s: %s%s" % (prefix, branch, role, node, suffix))
+
+        if root["type"] == "streaming":
+            streaming_lines(target, include_name=False)
+        else:
+            streaming_lines(root["publisher"], last=False)
+            streaming_lines(root["subscriber"], last=True)
         lines.append("")
         lines.append("CREATE ORDER")
         lines.extend(order)

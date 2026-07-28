@@ -25,6 +25,14 @@ nodes:
     host: host1
     port: 25433
     data_dir: ${PGDATA4:-/data/c1/sub2}
+  c21:
+    host: host1
+    port: 16432
+    data_dir: ${PGDATA5:-/data/c2/c21}
+  c22:
+    host: host1
+    port: 16433
+    data_dir: ${PGDATA6:-/data/c2/c22}
 
 clusters:
   publisher:
@@ -49,3 +57,9 @@ clusters:
     slot: c1_failover_slot
     copy_data: true
     failover: true
+  c2:
+    type: streaming
+    primary: c21
+    standbys:
+      - node: c22
+        slot: c22_physical_slot
