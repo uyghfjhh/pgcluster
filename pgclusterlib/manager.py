@@ -12,7 +12,6 @@ from .errors import OperationError, SafetyError
 
 MARKER = ".pgcluster-managed"
 LOCAL_HOSTS = {"127.0.0.1", "::1", "localhost", socket.gethostname(), socket.getfqdn()}
-SOCKET_DIR = "/var/run/postgresql"
 
 
 def quote_ident(value):
@@ -173,7 +172,7 @@ class Manager:
             "log_line_prefix": "'%m [%p] user=%u db=%d app=%a client=%r '", "log_error_verbosity": "verbose",
             "log_statement": "'all'", "log_duration": "on", "log_connections": "on", "log_disconnections": "on",
             "log_checkpoints": "on", "log_replication_commands": "on", "max_wal_senders": 10, "max_replication_slots": 10,
-            "max_logical_replication_workers": 4, "unix_socket_directories": quote_literal(SOCKET_DIR),
+            "max_logical_replication_workers": 4,
         }
         if publisher:
             settings.update({"wal_level": "logical", "hot_standby_feedback": "on"})
@@ -223,7 +222,6 @@ class Manager:
 
     def _start(self, node_name):
         node = self.config.node(node_name)
-        self._ensure_socket_directory(node_name)
         self.run([self.config.binary("pg_ctl"), "-D", node["data_dir"], "-l",
                   str(Path(node["data_dir"]) / "pg_ctl.log"), "-w", "start"],
                  host=self._host_address(node_name))
@@ -343,21 +341,6 @@ class Manager:
         raise OperationError(
             "无法创建 PGDATA 父目录 %s。请先执行: sudo install -d -o postgres -g postgres -m 0700 %s" %
             (parent, parent))
-
-    def _ensure_socket_directory(self, node_name):
-        """Keep Unix sockets where the Ubuntu system psql looks by default."""
-        address = self._host_address(node_name)
-        install = ["install", "-d", "-o", "postgres", "-g", "postgres", "-m", "0775", SOCKET_DIR]
-        result = self.run(install, host=address, check=False)
-        if result.returncode == 0:
-            return
-        if self._is_local(address):
-            elevated = self.run(["sudo", "-n"] + install, host=address, check=False)
-            if elevated.returncode == 0:
-                return
-        raise OperationError(
-            "无法创建 PostgreSQL socket 目录 %s。请先执行: sudo install -d -o postgres -g postgres -m 0775 %s" %
-            (SOCKET_DIR, SOCKET_DIR))
 
     def status(self, target):
         cluster_status = {}
