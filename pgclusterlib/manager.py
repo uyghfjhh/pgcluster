@@ -204,7 +204,7 @@ class Manager:
         data_dir = Path(node["data_dir"])
         if data_dir.exists() and any(data_dir.iterdir()):
             raise SafetyError("data_dir 已存在且非空，先 clean: %s" % data_dir)
-        data_dir.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_data_parent(node_name)
         self.run([self.config.binary("initdb"), "-D", str(data_dir), "-U", "postgres", "--auth-local=trust", "--auth-host=trust"])
         self._write_marker(node_name)
         self._write_files(node_name, publisher=publisher)
@@ -253,7 +253,7 @@ class Manager:
             data_dir = Path(self.config.node(standby_name)["data_dir"])
             if data_dir.exists() and any(data_dir.iterdir()):
                 raise SafetyError("data_dir 已存在且非空，先 clean: %s" % data_dir)
-            data_dir.parent.mkdir(parents=True, exist_ok=True)
+            self._ensure_data_parent(standby_name)
             self.run([self.config.binary("pg_basebackup"), "-h", self._host_address(primary), "-p",
                       str(self.config.node(primary)["port"]), "-U", "postgres", "-D", str(data_dir), "-R", "-X", "stream",
                       "-c", "fast", "-S", slot])
@@ -319,6 +319,28 @@ class Manager:
             else:
                 raise OperationError("MMR provider 尚未实现")
         return "创建完成: %s" % target
+
+    def _ensure_data_parent(self, node_name):
+        """Create the PGDATA parent with explicit PostgreSQL ownership.
+
+        initdb must receive an empty PGDATA, so this deliberately creates only
+        its parent.  A local test host may need sudo to create /data; remote
+        hosts must grant the SSH user permission beforehand.
+        """
+        data_dir = Path(self.config.node(node_name)["data_dir"])
+        parent = data_dir.parent
+        install = ["install", "-d", "-o", "postgres", "-g", "postgres", "-m", "0700", str(parent)]
+        address = self._host_address(node_name)
+        result = self.run(install, host=address, check=False)
+        if result.returncode == 0:
+            return
+        if self._is_local(address):
+            elevated = self.run(["sudo", "-n"] + install, host=address, check=False)
+            if elevated.returncode == 0:
+                return
+        raise OperationError(
+            "无法创建 PGDATA 父目录 %s。请先执行: sudo install -d -o postgres -g postgres -m 0700 %s" %
+            (parent, parent))
 
     def status(self, target):
         cluster_status = {}

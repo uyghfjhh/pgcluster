@@ -12,19 +12,19 @@ nodes:
   pub1:
     host: host1
     port: 15432
-    data_dir: ${PGDATA1:-/home/postgres/delopy/pgcluster/data/c1/pub1}
+    data_dir: ${PGDATA1:-/data/c1/pub1}
   pub2:
     host: host1
     port: 15433
-    data_dir: ${PGDATA2:-/home/postgres/delopy/pgcluster/data/c1/pub2}
+    data_dir: ${PGDATA2:-/data/c1/pub2}
   sub1:
     host: host1
     port: 25432
-    data_dir: ${PGDATA3:-/home/postgres/delopy/pgcluster/data/c1/sub1}
+    data_dir: ${PGDATA3:-/data/c1/sub1}
   sub2:
     host: host1
     port: 25433
-    data_dir: ${PGDATA4:-/home/postgres/delopy/pgcluster/data/c1/sub2}
+    data_dir: ${PGDATA4:-/data/c1/sub2}
 
 clusters:
   publisher:

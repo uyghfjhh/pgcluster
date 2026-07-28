@@ -37,12 +37,16 @@ CREATE TABLE public.test_tbl (
 
 | 节点 | 端口 | 默认 PGDATA |
 | --- | ---: | --- |
-| pub1 | 15432 | `data/c1/pub1` |
-| pub2 | 15433 | `data/c1/pub2` |
-| sub1 | 25432 | `data/c1/sub1` |
-| sub2 | 25433 | `data/c1/sub2` |
+| pub1 | 15432 | `/data/c1/pub1` |
+| pub2 | 15433 | `/data/c1/pub2` |
+| sub1 | 25432 | `/data/c1/sub1` |
+| sub2 | 25433 | `/data/c1/sub2` |
 
 环境变量只能占据整个字段，例如 `PGDATA1=/data/pub1`。不支持路径拼接。
+
+创建实例时，工具使用 `install -d -o postgres -g postgres -m 0700` 创建 PGDATA 的父目录；例如
+`/data/c1`。若 `/data` 尚不存在且当前用户没有根目录写权限，工具会在本机尝试无交互 sudo；不能
+sudo 的远程主机必须预先执行同一条 `install` 命令。
 
 ## 清理
 
