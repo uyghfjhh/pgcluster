@@ -12,19 +12,19 @@ nodes:
   pub1:
     host: host1
     port: 15432
-    data_dir: ${PGDATA1:-/home/postgres/delopy/pgcluster/data/logical1/pub1}
+    data_dir: ${PGDATA1:-/home/postgres/delopy/pgcluster/data/c1/pub1}
   pub2:
     host: host1
     port: 15433
-    data_dir: ${PGDATA2:-/home/postgres/delopy/pgcluster/data/logical1/pub2}
+    data_dir: ${PGDATA2:-/home/postgres/delopy/pgcluster/data/c1/pub2}
   sub1:
     host: host1
     port: 25432
-    data_dir: ${PGDATA3:-/home/postgres/delopy/pgcluster/data/logical1/sub1}
+    data_dir: ${PGDATA3:-/home/postgres/delopy/pgcluster/data/c1/sub1}
   sub2:
     host: host1
     port: 25433
-    data_dir: ${PGDATA4:-/home/postgres/delopy/pgcluster/data/logical1/sub2}
+    data_dir: ${PGDATA4:-/home/postgres/delopy/pgcluster/data/c1/sub2}
 
 clusters:
   publisher:
@@ -39,13 +39,13 @@ clusters:
     standbys:
       - node: sub2
         slot: sub2_physical_slot
-  logical1:
+  c1:
     type: logical
     publisher: publisher
     subscriber: subscriber
     tables: all
-    publication: logical1_pub
-    subscription: logical1_sub
-    slot: logical1_failover_slot
+    publication: c1_pub
+    subscription: c1_sub
+    slot: c1_failover_slot
     copy_data: true
     failover: true

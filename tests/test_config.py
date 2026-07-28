@@ -9,8 +9,8 @@ class ConfigTest(unittest.TestCase):
     def test_complete_example_validates(self):
         root = Path(__file__).parents[1]
         config = load(root / "pgcluster.yaml")
-        self.assertEqual(config.closure("logical1"), ["publisher", "subscriber", "logical1"])
-        self.assertEqual(config.logical_names("logical1")["slot"], "logical1_failover_slot")
+        self.assertEqual(config.closure("c1"), ["publisher", "subscriber", "c1"])
+        self.assertEqual(config.logical_names("c1")["slot"], "c1_failover_slot")
 
     def test_environment_value_is_whole_field(self):
         original = os.environ.get("PGDATA1")

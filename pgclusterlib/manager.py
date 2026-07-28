@@ -408,9 +408,9 @@ class Manager:
                   quote_ident(subscription))
         self.psql(publisher,
                   "INSERT INTO public.test_tbl(id, name) "
-                  "SELECT 1, 'logical1-probe' "
+                  "SELECT 1, 'c1-probe' "
                   "WHERE NOT EXISTS (SELECT 1 FROM public.test_tbl WHERE id = 1)")
-        expected = "1|logical1-probe"
+        expected = "1|c1-probe"
         until = time.monotonic() + 30
         nodes = [subscriber] + ([subscriber_standby] if subscriber_standby else [])
         while time.monotonic() < until:
