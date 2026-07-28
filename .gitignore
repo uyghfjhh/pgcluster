@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+
+# Build and test artifacts
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local runtime files
+operation.log
+*.log
+*.pid
+.env
+pgcluster.local.yaml
+data/
+
+# IDE and operating-system files
+.vscode/
+.idea/
+.DS_Store
