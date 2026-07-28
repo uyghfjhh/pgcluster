@@ -1,8 +1,9 @@
 import unittest
+from copy import deepcopy
 from pathlib import Path
 from unittest.mock import Mock
 
-from pgclusterlib.config import load
+from pgclusterlib.config import Config, load
 from pgclusterlib.errors import OperationError, SafetyError
 from pgclusterlib.manager import Manager
 
@@ -36,3 +37,10 @@ class ManagerTest(unittest.TestCase):
         manager = Manager(self.config)
         with self.assertRaisesRegex(OperationError, "fbase provider 尚未实现"):
             manager.doctor("c1")
+
+    def test_mmr_clean_fails_instead_of_reporting_false_success(self):
+        raw = deepcopy(self.config.raw)
+        raw["clusters"]["mmr1"] = {"type": "mmr", "nodes": ["c31", "c32"]}
+        manager = Manager(Config("memory.yaml", raw))
+        with self.assertRaisesRegex(OperationError, "MMR provider 尚未实现"):
+            manager.clean("mmr1", yes=True)

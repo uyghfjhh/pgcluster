@@ -56,6 +56,16 @@ class Manager:
         self.config.closure(target)
         return "配置有效: %s" % target
 
+    def _require_supported_features(self, target):
+        self.provider.require_available()
+        if self.config.extensions:
+            raise OperationError("FBase 等保插件 provider 尚未实现")
+        if any(
+            self.config.cluster(name)["type"] == "mmr"
+            for name in self.config.closure(target)
+        ):
+            raise OperationError("MMR provider 尚未实现")
+
     def graph(self, target):
         order = self.config.topology.action_order(target)
         root = self.config.cluster(target)
@@ -103,9 +113,7 @@ class Manager:
 
     def doctor(self, target):
         self.validate(target)
-        self.provider.require_available()
-        if self.config.cluster(target)["type"] == "mmr":
-            raise OperationError("MMR provider 尚未实现")
+        self._require_supported_features(target)
         binaries = ("postgres", "initdb", "pg_ctl", "psql", "pg_basebackup", "pg_isready")
         needs_failover = any(
             self.config.cluster(name).get("type") == "logical" and
@@ -504,9 +512,7 @@ class Manager:
         return self.psql(node, sql, database=database, tuples=tuples)
 
     def create(self, target):
-        self.provider.require_available()
-        if self.config.extensions:
-            raise OperationError("FBase 等保插件 provider 尚未实现")
+        self._require_supported_features(target)
         self.doctor(target)
         order = self.config.closure(target)
         for name in order:
@@ -548,10 +554,8 @@ class Manager:
             (parent, parent))
 
     def _health(self, target):
-        self.provider.require_available()
+        self._require_supported_features(target)
         root = self.config.cluster(target)
-        if root["type"] == "mmr":
-            raise OperationError("MMR provider 尚未实现")
         checker = HealthChecker(self.config, self.psql, self.provider)
         group_health = {}
         for group in self.config.topology.groups(target):
@@ -609,6 +613,7 @@ class Manager:
         return "\n".join(lines)
 
     def start(self, target):
+        self._require_supported_features(target)
         for node_name in self._nodes_for_target(target):
             self._require_marker(node_name)
             ready = self.run([self.config.binary("pg_isready"), "-h", self._host_address(node_name), "-p",
@@ -619,6 +624,7 @@ class Manager:
         return "已启动: %s" % target
 
     def stop(self, target):
+        self._require_supported_features(target)
         self.config.topology.require_removable(target, "停止")
         for node_name in reversed(self._nodes_for_target(target)):
             self._require_marker(node_name)
@@ -633,7 +639,7 @@ class Manager:
         return "已重启: %s" % target
 
     def verify(self, target):
-        self.provider.require_available()
+        self._require_supported_features(target)
         cluster = self.config.cluster(target)
         if cluster["type"] != "logical":
             raise OperationError("verify 当前要求 logical 集群")
@@ -680,6 +686,7 @@ class Manager:
     def clean(self, target, yes=False):
         if not yes:
             raise SafetyError("clean 会删除 PGDATA；请使用 --yes")
+        self._require_supported_features(target)
         self.config.topology.require_removable(target, "清理")
         nodes = self._nodes_for_target(target)
         existing_nodes = [
