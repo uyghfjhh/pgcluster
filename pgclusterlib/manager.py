@@ -378,10 +378,29 @@ class Manager:
                 root_ok = active == "1" and synced == "true"
             except OperationError:
                 root_ok = False
-        lines = ["CLUSTER %s %s" % (target, "OK" if root_ok else "FAILED")]
-        for name in streaming_names:
-            lines.append("%s %s" % (name, cluster_status[name]))
-            lines.extend("  %s %s" % item for item in details[name])
+        def line(label, state):
+            return "%-48s %s" % (label, state)
+
+        root_kind = root["type"]
+        lines = [line("CLUSTER %s [%s]" % (target, root_kind), "OK" if root_ok else "FAILED")]
+        for cluster_index, name in enumerate(streaming_names):
+            streaming = self.config.cluster(name)
+            last_cluster = cluster_index == len(streaming_names) - 1
+            cluster_branch = "└──" if last_cluster else "├──"
+            cluster_indent = "    " if last_cluster else "│   "
+            lines.append(line("%s %s [streaming]" % (cluster_branch, name), cluster_status[name]))
+            node_names = self._nodes_for_streaming(name)
+            for node_index, node_name in enumerate(node_names):
+                last_node = node_index == len(node_names) - 1
+                node_branch = "└──" if last_node else "├──"
+                node_indent = cluster_indent + ("    " if last_node else "│   ")
+                role = "primary" if node_name == streaming["primary"] else "standby"
+                node = self.config.node(node_name)
+                state = dict(details[name])[node_name]
+                lines.append(line("%s%s %s [%s]" % (cluster_indent, node_branch, node_name, role), state))
+                lines.append("%s├── listen: %s:%s" %
+                             (node_indent, self._host_address(node_name), node["port"]))
+                lines.append("%s└── data_dir: %s" % (node_indent, node["data_dir"]))
         return "\n".join(lines)
 
     def start(self, target):
