@@ -1,70 +1,79 @@
 # pgcluster
 
-`pgcluster` 是一个面向自用测试环境的 PostgreSQL 集群搭建工具。首版支持：
+`pgcluster` 用于快速创建 PostgreSQL 测试集群。目前支持：
 
-- 单主单备流复制；
-- 发布端流复制集群 → 逻辑复制（故障转移槽）→ 订阅端流复制集群；
-- PostgreSQL 17+ 原生逻辑故障转移槽；
-- `validate`、`graph`、`doctor`、`create`、`status`、`verify`、`clean`；
-- 每次操作覆盖一个可手工复现的 `operation.log`。
+- 单节点实例；
+- 带物理复制槽的流复制集群；
+- 两个节点之间的简单逻辑复制；
+- 两套流复制集群之间的逻辑复制和 PostgreSQL 17+ 原生故障转移槽；
+- 本机和 SSH 远程主机；
+- 依赖检查、幂等创建、健康检查和安全清理。
 
-FBase 故障槽、等保插件和 MMR 已预留 provider 接口，首版会明确报“尚未实现”。
+FBase 故障槽、等保插件和 MMR 暂未实现，接口已经隔离，配置使用时会明确报错。
 
-## 快速开始
+## 使用
 
-本仓库的 `pgcluster.yaml` 是可直接运行的 `c1` 示例，默认使用本机 PostgreSQL 18.3：
+仓库内的 [pgcluster.yaml](pgcluster.yaml) 包含三个拓扑：
+
+- `c1`：发布端主备 → 逻辑复制 → 订阅端主备；
+- `c2`：一主一备流复制；
+- `c3`：两个单节点之间的简单逻辑复制。
 
 ```bash
 ./pgcluster validate c1
+./pgcluster graph c1
 ./pgcluster doctor c1
 ./pgcluster create c1
 ./pgcluster status c1
 ./pgcluster verify c1
 ```
 
-`verify` 会在 `pub1`、`sub1` 创建：
-
-```sql
-CREATE TABLE public.test_tbl (
-  id integer NOT NULL,
-  name text
-);
-```
-
-然后写入 `1, 'c1-probe'`，并确认该行从 `pub1` 逻辑复制到 `sub1`，再物理复制到 `sub2`。
-
-默认端口和 PGDATA：
-
-| 节点 | 端口 | 默认 PGDATA |
-| --- | ---: | --- |
-| pub1 | 15432 | `/data/c1/pub1` |
-| pub2 | 15433 | `/data/c1/pub2` |
-| sub1 | 25432 | `/data/c1/sub1` |
-| sub2 | 25433 | `/data/c1/sub2` |
-
-环境变量只能占据整个字段，例如 `PGDATA1=/data/pub1`。不支持路径拼接。
-
-创建实例时，工具使用 `install -d -o postgres -g postgres -m 0700` 创建 PGDATA 的父目录；例如
-`/data/c1`。若 `/data` 尚不存在且当前用户没有根目录写权限，工具会在本机尝试无交互 sudo；不能
-sudo 的远程主机必须预先执行同一条 `install` 命令。
-
-## 清理
+`create` 可以重复执行：已有且 marker 匹配的实例会被复用，缺少的资源会继续创建。配置冲突或
+非 pgcluster 管理的 PGDATA 会直接报错。
 
 ```bash
+./pgcluster stop c1
+./pgcluster start c1
+./pgcluster restart c1
 ./pgcluster clean c1 --yes
 ```
 
-`clean` 只删除带有 `PGDATA/.pgcluster-managed` 且内容与节点配置一致的目录。它会先停止实例，再删除 PGDATA。
+停止或清理底层集群前会检查反向依赖。例如 `publisher` 仍被 `c1` 使用时，不能单独
+`stop` 或 `clean publisher`。
 
-## 日志
+## 默认行为
 
-- 工具操作日志：默认 `/home/postgres/operation.log`（可用 `PGCLUSTER_LOG` 或 YAML 的 `operation_log` 修改）。
-- PostgreSQL 日志：`<PGDATA>/log/`。
+- PostgreSQL：`${PGHOME:-/usr/local/pgsql18.3}`
+- 操作日志：`${PGCLUSTER_LOG:-/home/postgres/operation.log}`
+- PostgreSQL 日志：`<PGDATA>/log/`
+- Unix Socket：使用 PostgreSQL 编译默认值，本环境为 `/tmp`
+- `listen_addresses = '*'`
+- 测试环境的 `pg_hba.conf` 默认允许所有普通连接和复制连接
 
-实例使用 `/usr/local/pgsql18.3` 二进制的默认 Unix Socket 目录 `/tmp`；因此本机可直接使用
-`psql -p 15432`，远程或明确 TCP 连接使用 `psql -h 127.0.0.1 -p 15432`。
+环境变量必须占据整个字段，例如：
 
-实例默认启用 `logging_collector`、`log_statement = 'all'` 和 `log_error_verbosity = verbose`；普通 `.log` 中会包含 PostgreSQL 内部函数、C 源文件和行号。
+```yaml
+data_dir: ${PGDATA1:-/data/c1/pub1}
+```
+
+不支持把环境变量与路径片段拼接。
+
+远程主机使用当前操作系统用户进行 SSH 免密登录；PostgreSQL 二进制需要安装在各主机相同的
+`postgres.home`。创建 `/data` 等目录时可能需要免交互 `sudo`。
+
+## 状态与验证
+
+`status` 不只检查端口，还验证主备角色、WAL receiver/sender、物理槽、publication、
+subscription、逻辑槽和故障槽同步状态。集群为 `FAILED` 时命令退出码为 `1`。
+
+`verify` 使用专用的 `pgcluster_verify.probe` 表写入随机 token，不占用业务表。
+
+## 安全与日志
+
+`clean` 只删除 marker 内容与节点配置完全一致的 PGDATA，并通过依赖图阻止错误的底层清理。
+修改命令使用配置级文件锁，避免两个 pgcluster 进程同时操作同一套环境。
+
+`operation.log` 每次覆盖，记录实际执行的本机/SSH命令、SQL、文件写入内容、输出和退出码。
 
 ## 测试
 

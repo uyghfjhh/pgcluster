@@ -19,6 +19,7 @@ operation.log
 *.pid
 .env
 pgcluster.local.yaml
+.pgcluster.yaml.lock
 data/
 
 # IDE and operating-system files

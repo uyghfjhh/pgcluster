@@ -1,11 +1,20 @@
 import os
 import unittest
+from copy import deepcopy
 from pathlib import Path
 
-from pgclusterlib.config import load
+import yaml
+
+from pgclusterlib.config import Config, load
+from pgclusterlib.errors import ConfigError
 
 
 class ConfigTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.root = Path(__file__).parents[1]
+        cls.raw = yaml.safe_load((cls.root / "pgcluster.yaml").read_text(encoding="utf-8"))
+
     def test_complete_example_validates(self):
         root = Path(__file__).parents[1]
         config = load(root / "pgcluster.yaml")
@@ -14,6 +23,8 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(config.closure("c3"), ["c3"])
         self.assertEqual(config.logical_node("c3", "publisher"), "c31")
         self.assertEqual(config.logical_node("c3", "subscriber"), "c32")
+        self.assertEqual(config.topology.action_order("c3"), ["c31", "c32", "c3"])
+        self.assertEqual(config.topology.external_dependents("publisher"), ["c1"])
 
     def test_environment_value_is_whole_field(self):
         original = os.environ.get("PGDATA1")
@@ -26,3 +37,50 @@ class ConfigTest(unittest.TestCase):
                 os.environ.pop("PGDATA1", None)
             else:
                 os.environ["PGDATA1"] = original
+
+    def test_logical_boolean_must_be_boolean(self):
+        raw = deepcopy(self.raw)
+        raw["clusters"]["c3"]["failover"] = "false"
+        with self.assertRaisesRegex(ConfigError, "必须是布尔值"):
+            Config("memory.yaml", raw)
+
+    def test_failover_requires_publisher_standby(self):
+        raw = deepcopy(self.raw)
+        raw["clusters"]["c3"]["failover"] = True
+        with self.assertRaisesRegex(ConfigError, "带备库"):
+            Config("memory.yaml", raw)
+
+    def test_node_and_cluster_names_cannot_overlap(self):
+        raw = deepcopy(self.raw)
+        raw["clusters"]["c31"] = {"type": "streaming", "primary": "c21"}
+        with self.assertRaisesRegex(ConfigError, "不能重复"):
+            Config("memory.yaml", raw)
+
+    def test_duplicate_standby_is_rejected(self):
+        raw = deepcopy(self.raw)
+        raw["clusters"]["c2"]["standbys"].append(
+            {"node": "c22", "slot": "another_slot"}
+        )
+        with self.assertRaisesRegex(ConfigError, "重复节点"):
+            Config("memory.yaml", raw)
+
+    def test_duplicate_physical_slot_is_rejected(self):
+        raw = deepcopy(self.raw)
+        raw["nodes"]["c23"] = {
+            "host": "host1",
+            "port": 16434,
+            "data_dir": "/data/c2/c23",
+        }
+        raw["clusters"]["c2"]["standbys"].append(
+            {"node": "c23", "slot": "c22_physical_slot"}
+        )
+        with self.assertRaisesRegex(ConfigError, "重复物理槽"):
+            Config("memory.yaml", raw)
+
+    def test_same_data_dir_is_allowed_on_different_hosts(self):
+        raw = deepcopy(self.raw)
+        raw["hosts"]["host2"] = "192.0.2.2"
+        raw["nodes"]["c31"]["host"] = "host2"
+        raw["nodes"]["c31"]["data_dir"] = raw["nodes"]["c21"]["data_dir"]
+        config = Config("memory.yaml", raw)
+        self.assertEqual(config.node("c31")["host"], "host2")
