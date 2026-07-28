@@ -61,6 +61,9 @@ sudo 的远程主机必须预先执行同一条 `install` 命令。
 - 工具操作日志：默认 `/home/postgres/operation.log`（可用 `PGCLUSTER_LOG` 或 YAML 的 `operation_log` 修改）。
 - PostgreSQL 日志：`<PGDATA>/log/`。
 
+实例会监听 TCP `0.0.0.0` 与 Unix Socket `/var/run/postgresql`；因此系统默认 `psql -p 15432`
+即可连接，远程或明确 TCP 连接使用 `psql -h 127.0.0.1 -p 15432`。
+
 实例默认启用 `logging_collector`、`log_statement = 'all'` 和 `log_error_verbosity = verbose`；普通 `.log` 中会包含 PostgreSQL 内部函数、C 源文件和行号。
 
 ## 测试
