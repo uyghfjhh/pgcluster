@@ -115,8 +115,14 @@ class Manager:
         if root["type"] == "streaming":
             streaming_lines(target, include_name=False)
         else:
-            streaming_lines(root["publisher"], last=False)
-            streaming_lines(root["subscriber"], last=True)
+            for index, field in enumerate(("publisher", "subscriber")):
+                last = index == 1
+                streaming = self.config.logical_streaming(target, field)
+                if streaming:
+                    streaming_lines(streaming, last=last)
+                else:
+                    node = self.config.logical_node(target, field)
+                    lines.append("%s %s: %s" % ("└──" if last else "├──", field, node))
         lines.append("")
         lines.append("CREATE ORDER")
         lines.extend(order)
@@ -171,6 +177,18 @@ class Manager:
     def _nodes_for_streaming(self, cluster_name):
         cluster = self.config.cluster(cluster_name)
         return [cluster["primary"]] + [item["node"] for item in cluster.get("standbys") or []]
+
+    def _nodes_for_target(self, target):
+        nodes = []
+        for cluster_name in self.config.closure(target):
+            cluster = self.config.cluster(cluster_name)
+            if cluster["type"] == "streaming":
+                nodes.extend(self._nodes_for_streaming(cluster_name))
+            elif cluster["type"] == "logical":
+                for field in ("publisher", "subscriber"):
+                    if self.config.logical_streaming(cluster_name, field) is None:
+                        nodes.append(self.config.logical_node(cluster_name, field))
+        return list(dict.fromkeys(nodes))
 
     def _write_files(self, node_name, publisher=False, standby_slot=None, primary_name=None):
         node = self.config.node(node_name)
@@ -276,10 +294,12 @@ class Manager:
         cluster = self.config.cluster(cluster_name)
         names = self.config.logical_names(cluster_name)
         failover = "true" if cluster.get("failover", False) else "false"
-        publisher_cluster = self.config.cluster(cluster["publisher"])
-        subscriber_cluster = self.config.cluster(cluster["subscriber"])
-        publisher = publisher_cluster["primary"]
-        subscriber = subscriber_cluster["primary"]
+        publisher = self.config.logical_node(cluster_name, "publisher")
+        subscriber = self.config.logical_node(cluster_name, "subscriber")
+        if self.config.logical_streaming(cluster_name, "publisher") is None:
+            self._init_primary(publisher, publisher=True)
+        if self.config.logical_streaming(cluster_name, "subscriber") is None:
+            self._init_primary(subscriber, publisher=False)
         database = cluster.get("database", "postgres")
         self.psql(publisher, "CREATE PUBLICATION %s FOR ALL TABLES" % quote_ident(names["publication"]), database)
         self.psql(publisher, "SELECT pg_create_logical_replication_slot(%s, 'pgoutput', false, false, %s)" %
@@ -297,7 +317,10 @@ class Manager:
     def _wait_for_slot_sync(self, logical_name, seconds=30):
         cluster = self.config.cluster(logical_name)
         names = self.config.logical_names(logical_name)
-        publisher = self.config.cluster(cluster["publisher"])
+        publisher_name = self.config.logical_streaming(logical_name, "publisher")
+        if publisher_name is None:
+            return
+        publisher = self.config.cluster(publisher_name)
         standby_nodes = [item["node"] for item in publisher.get("standbys") or []]
         if not standby_nodes:
             return
@@ -375,8 +398,9 @@ class Manager:
         if root["type"] == "logical" and root_ok:
             try:
                 names = self.config.logical_names(target)
-                subscriber = self.config.cluster(root["subscriber"])["primary"]
-                publisher = self.config.cluster(root["publisher"])
+                subscriber = self.config.logical_node(target, "subscriber")
+                publisher_name = self.config.logical_streaming(target, "publisher")
+                publisher = self.config.cluster(publisher_name) if publisher_name else {"standbys": []}
                 active = self.psql(subscriber, "SELECT count(*) FROM pg_stat_subscription WHERE subname = %s AND pid IS NOT NULL" %
                                   quote_literal(names["subscription"]), tuples=True)
                 synced = "true"
@@ -394,6 +418,17 @@ class Manager:
 
         root_kind = root["type"]
         lines = [line("CLUSTER %s [%s]" % (target, root_kind), "OK" if root_ok else "FAILED")]
+        if root["type"] == "logical":
+            direct_nodes = [(field, self.config.logical_node(target, field)) for field in ("publisher", "subscriber")
+                            if self.config.logical_streaming(target, field) is None]
+            for index, (role, node_name) in enumerate(direct_nodes):
+                last = index == len(direct_nodes) - 1
+                node = self.config.node(node_name)
+                result = self.run([self.config.binary("pg_isready"), "-h", self._host_address(node_name), "-p",
+                                   str(node["port"])], host=self._host_address(node_name), check=False)
+                state = "OK" if result.returncode == 0 else "FAILED"
+                lines.append(line("%s %s: %s" % ("└──" if last else "├──", role, node_name), state))
+                lines.append("    %s listen: %s:%s" % (" " if last else "│", self._host_address(node_name), node["port"]))
         for cluster_index, name in enumerate(streaming_names):
             streaming = self.config.cluster(name)
             last_cluster = cluster_index == len(streaming_names) - 1
@@ -415,28 +450,20 @@ class Manager:
         return "\n".join(lines)
 
     def start(self, target):
-        for cluster_name in self.config.closure(target):
-            cluster = self.config.cluster(cluster_name)
-            if cluster["type"] != "streaming":
-                continue
-            for node_name in self._nodes_for_streaming(cluster_name):
-                self._require_marker(node_name)
-                ready = self.run([self.config.binary("pg_isready"), "-h", self._host_address(node_name), "-p",
-                                  str(self.config.node(node_name)["port"])], check=False)
-                if ready.returncode:
-                    self._start(node_name)
+        for node_name in self._nodes_for_target(target):
+            self._require_marker(node_name)
+            ready = self.run([self.config.binary("pg_isready"), "-h", self._host_address(node_name), "-p",
+                              str(self.config.node(node_name)["port"])], check=False)
+            if ready.returncode:
+                self._start(node_name)
         return "已启动: %s" % target
 
     def stop(self, target):
-        for cluster_name in reversed(self.config.closure(target)):
-            cluster = self.config.cluster(cluster_name)
-            if cluster["type"] != "streaming":
-                continue
-            for node_name in reversed(self._nodes_for_streaming(cluster_name)):
-                self._require_marker(node_name)
-                node = self.config.node(node_name)
-                self.run([self.config.binary("pg_ctl"), "-D", node["data_dir"], "-m", "fast", "-w", "stop"],
-                         host=self._host_address(node_name), check=False)
+        for node_name in reversed(self._nodes_for_target(target)):
+            self._require_marker(node_name)
+            node = self.config.node(node_name)
+            self.run([self.config.binary("pg_ctl"), "-D", node["data_dir"], "-m", "fast", "-w", "stop"],
+                     host=self._host_address(node_name), check=False)
         return "已停止: %s" % target
 
     def restart(self, target):
@@ -448,9 +475,10 @@ class Manager:
         cluster = self.config.cluster(target)
         if cluster["type"] != "logical":
             raise OperationError("verify 当前要求 logical 集群")
-        publisher = self.config.cluster(cluster["publisher"])["primary"]
-        subscriber_stream = self.config.cluster(cluster["subscriber"])
-        subscriber = subscriber_stream["primary"]
+        publisher = self.config.logical_node(target, "publisher")
+        subscriber = self.config.logical_node(target, "subscriber")
+        subscriber_name = self.config.logical_streaming(target, "subscriber")
+        subscriber_stream = self.config.cluster(subscriber_name) if subscriber_name else {"standbys": []}
         subscriber_standby = (subscriber_stream.get("standbys") or [{}])[0].get("node")
         schema = "CREATE TABLE IF NOT EXISTS public.test_tbl (id integer NOT NULL, name text)"
         self.psql(publisher, schema)
@@ -476,12 +504,7 @@ class Manager:
     def clean(self, target, yes=False):
         if not yes:
             raise SafetyError("clean 会删除 PGDATA；请使用 --yes")
-        clusters = self.config.closure(target)
-        nodes = []
-        for cluster_name in clusters:
-            cluster = self.config.cluster(cluster_name)
-            if cluster["type"] == "streaming":
-                nodes.extend(self._nodes_for_streaming(cluster_name))
+        nodes = self._nodes_for_target(target)
         existing_nodes = [node_name for node_name in nodes if Path(self.config.node(node_name)["data_dir"]).exists()]
         for node_name in existing_nodes:
             self._require_marker(node_name)

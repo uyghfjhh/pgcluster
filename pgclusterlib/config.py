@@ -68,7 +68,20 @@ class Config:
 
     def dependencies(self, name):
         cluster = self.cluster(name)
-        return [cluster["publisher"], cluster["subscriber"]] if cluster["type"] == "logical" else []
+        if cluster["type"] != "logical":
+            return []
+        return [target for target in (cluster["publisher"], cluster["subscriber"])
+                if target in self.clusters]
+
+    def logical_node(self, name, field):
+        target = self.cluster(name)[field]
+        if target in self.nodes:
+            return target
+        return self.cluster(target)["primary"]
+
+    def logical_streaming(self, name, field):
+        target = self.cluster(name)[field]
+        return target if target in self.clusters else None
 
     def closure(self, target):
         result, seen = [], set()
@@ -139,8 +152,10 @@ class Config:
             elif kind == "logical":
                 for field in ("publisher", "subscriber"):
                     target = cluster.get(field)
+                    if target in self.nodes:
+                        continue
                     if target not in self.clusters or self.clusters[target].get("type") != "streaming":
-                        raise ConfigError("clusters.%s.%s 必须引用 streaming 集群" % (name, field))
+                        raise ConfigError("clusters.%s.%s 必须引用节点或 streaming 集群" % (name, field))
                 if cluster.get("tables", "all") != "all":
                     raise ConfigError("首版仅支持 tables: all")
                 for field, value in self.logical_names(name).items():

@@ -71,16 +71,10 @@ clusters:
     standbys:
       - node: c22
         slot: c22_physical_slot
-  c3_publisher:
-    type: streaming
-    primary: c31
-  c3_subscriber:
-    type: streaming
-    primary: c32
   c3:
     type: logical
-    publisher: c3_publisher
-    subscriber: c3_subscriber
+    publisher: c31
+    subscriber: c32
     tables: all
     publication: c3_pub
     subscription: c3_sub
