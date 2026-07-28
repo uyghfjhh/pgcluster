@@ -275,21 +275,22 @@ class Manager:
     def _create_logical(self, cluster_name):
         cluster = self.config.cluster(cluster_name)
         names = self.config.logical_names(cluster_name)
+        failover = "true" if cluster.get("failover", False) else "false"
         publisher_cluster = self.config.cluster(cluster["publisher"])
         subscriber_cluster = self.config.cluster(cluster["subscriber"])
         publisher = publisher_cluster["primary"]
         subscriber = subscriber_cluster["primary"]
         database = cluster.get("database", "postgres")
         self.psql(publisher, "CREATE PUBLICATION %s FOR ALL TABLES" % quote_ident(names["publication"]), database)
-        self.psql(publisher, "SELECT pg_create_logical_replication_slot(%s, 'pgoutput', false, false, true)" %
-                  quote_literal(names["slot"]), database)
+        self.psql(publisher, "SELECT pg_create_logical_replication_slot(%s, 'pgoutput', false, false, %s)" %
+                  (quote_literal(names["slot"]), failover), database)
         publisher_node = self.config.node(publisher)
         connection = "host=%s port=%s user=postgres dbname=%s" % (
             self._host_address(publisher), publisher_node["port"], database)
         sql = ("CREATE SUBSCRIPTION %s CONNECTION %s PUBLICATION %s "
-               "WITH (connect = true, create_slot = false, enabled = true, slot_name = %s, copy_data = %s, failover = true)") % (
+               "WITH (connect = true, create_slot = false, enabled = true, slot_name = %s, copy_data = %s, failover = %s)") % (
                    quote_ident(names["subscription"]), quote_literal(connection), quote_ident(names["publication"]),
-                   quote_literal(names["slot"]), "true" if cluster.get("copy_data", True) else "false")
+                   quote_literal(names["slot"]), "true" if cluster.get("copy_data", True) else "false", failover)
         self.psql(subscriber, sql, database)
         self._wait_for_slot_sync(cluster_name)
 

@@ -33,6 +33,14 @@ nodes:
     host: host1
     port: 16433
     data_dir: ${PGDATA6:-/data/c2/c22}
+  c31:
+    host: host1
+    port: 17432
+    data_dir: ${PGDATA7:-/data/c3/c31}
+  c32:
+    host: host1
+    port: 17433
+    data_dir: ${PGDATA8:-/data/c3/c32}
 
 clusters:
   publisher:
@@ -63,3 +71,19 @@ clusters:
     standbys:
       - node: c22
         slot: c22_physical_slot
+  c3_publisher:
+    type: streaming
+    primary: c31
+  c3_subscriber:
+    type: streaming
+    primary: c32
+  c3:
+    type: logical
+    publisher: c3_publisher
+    subscriber: c3_subscriber
+    tables: all
+    publication: c3_pub
+    subscription: c3_sub
+    slot: c3_slot
+    copy_data: true
+    failover: false
