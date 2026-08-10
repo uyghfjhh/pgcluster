@@ -16,6 +16,7 @@ class ManagerTest(unittest.TestCase):
 
     def test_graph_direct_logical_has_real_action_order(self):
         graph = self.manager.graph("c3")
+        self.assertIn("CLUSTER c3 [logical, async]", graph)
         self.assertIn("├── publisher: c31", graph)
         self.assertIn("c3 -> c31", graph)
         self.assertIn("c31 -> host1", graph)
@@ -31,6 +32,35 @@ class ManagerTest(unittest.TestCase):
         self.manager.psql = Mock(side_effect=AssertionError("psql called"))
         self.manager._wait_for_slot_sync("c3")
         self.manager.psql.assert_not_called()
+
+    def test_sync_streaming_waits_for_configured_standby(self):
+        raw = deepcopy(self.config.raw)
+        raw["clusters"]["c2"]["replication_mode"] = "sync"
+        manager = Manager(Config("memory.yaml", raw))
+        manager.psql = Mock(return_value="")
+
+        manager._apply_synchronous_replication("c21")
+
+        sql = [call.args[1] for call in manager.psql.call_args_list]
+        self.assertIn(
+            "ALTER SYSTEM SET synchronous_standby_names = 'FIRST 1 (\"c22\")'",
+            sql,
+        )
+        self.assertIn("ALTER SYSTEM SET synchronous_commit = 'remote_apply'", sql)
+
+    def test_sync_logical_waits_for_subscription_application_name(self):
+        raw = deepcopy(self.config.raw)
+        raw["clusters"]["c3"]["replication_mode"] = "sync"
+        manager = Manager(Config("memory.yaml", raw))
+        manager.psql = Mock(return_value="1")
+
+        manager._apply_synchronous_replication("c31")
+
+        sql = [call.args[1] for call in manager.psql.call_args_list]
+        self.assertIn(
+            "ALTER SYSTEM SET synchronous_standby_names = 'FIRST 1 (\"c3_sub\")'",
+            sql,
+        )
 
     def test_fbase_provider_fails_explicitly(self):
         self.config.postgres["provider"] = "fbase"

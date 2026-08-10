@@ -79,6 +79,12 @@ class Config:
     def physical_slot(self, streaming_name, standby):
         return standby.get("slot") or "%s_%s_physical_slot" % (streaming_name, standby["node"])
 
+    def replication_mode(self, name):
+        return self.cluster(name).get("replication_mode", "async")
+
+    def synchronous_commit(self, name):
+        return self.cluster(name).get("synchronous_commit", "remote_apply")
+
     def dependencies(self, name):
         return list(self.topology.dependencies(name))
 
@@ -151,6 +157,21 @@ class Config:
             kind = cluster.get("type")
             if kind not in {"streaming", "logical", "mmr"}:
                 raise ConfigError("clusters.%s.type 不支持: %r" % (name, kind))
+            if kind in {"streaming", "logical"}:
+                mode = cluster.get("replication_mode", "async")
+                if mode not in {"async", "sync"}:
+                    raise ConfigError(
+                        "clusters.%s.replication_mode 只能是 async 或 sync" % name
+                    )
+                if "synchronous_commit" in cluster:
+                    if mode != "sync":
+                        raise ConfigError(
+                            "clusters.%s.synchronous_commit 仅能在 replication_mode: sync 时配置" % name
+                        )
+                    if cluster["synchronous_commit"] not in {"remote_write", "on", "remote_apply"}:
+                        raise ConfigError(
+                            "clusters.%s.synchronous_commit 只能是 remote_write、on 或 remote_apply" % name
+                        )
             if kind == "streaming":
                 primary = cluster.get("primary")
                 if primary not in self.nodes:
@@ -158,6 +179,8 @@ class Config:
                 standbys = cluster.get("standbys") or []
                 if not isinstance(standbys, list):
                     raise ConfigError("clusters.%s.standbys 必须是列表" % name)
+                if self.replication_mode(name) == "sync" and not standbys:
+                    raise ConfigError("clusters.%s 同步流复制至少需要一个备库" % name)
                 members = [primary]
                 slots = set()
                 for standby in standbys:

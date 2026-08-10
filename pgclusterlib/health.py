@@ -79,6 +79,17 @@ class HealthChecker:
                 if sender != "1" or slot != "1":
                     ok = False
                     reason = "主库 sender 或物理复制槽不正常"
+                if group.explicit and self.config.replication_mode(group.name) == "sync":
+                    sync_sender = self.psql(
+                        group.primary,
+                        "SELECT count(*) FROM pg_stat_replication "
+                        "WHERE application_name = %s AND sync_state IN ('sync', 'quorum')" %
+                        self._literal(standby.node),
+                        tuples=True,
+                    )
+                    if sync_sender != "1":
+                        ok = False
+                        reason = "备库未进入同步复制状态"
             except (OperationError, ValueError) as exc:
                 ok = False
                 reason = str(exc)
@@ -114,6 +125,22 @@ class HealthChecker:
                 return False
             if subscription != "true|%s|true" % names["slot"]:
                 return False
+            if self.config.replication_mode(logical_name) == "sync":
+                sync_sender = self.psql(
+                    publisher.primary,
+                    "SELECT count(*) FROM pg_stat_replication "
+                    "WHERE application_name = %s AND state = 'streaming' "
+                    "AND sync_state IN ('sync', 'quorum')" %
+                    self._literal(names["subscription"]),
+                    tuples=True,
+                )
+                commit = self.psql(
+                    publisher.primary,
+                    "SELECT current_setting('synchronous_commit')",
+                    tuples=True,
+                )
+                if sync_sender != "1" or commit != self.config.synchronous_commit(logical_name):
+                    return False
             return True
         except OperationError:
             return False

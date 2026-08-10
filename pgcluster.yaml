@@ -45,18 +45,21 @@ nodes:
 clusters:
   publisher:
     type: streaming
+    replication_mode: async
     primary: pub1
     standbys:
       - node: pub2
         slot: pub2_physical_slot
   subscriber:
     type: streaming
+    replication_mode: async
     primary: sub1
     standbys:
       - node: sub2
         slot: sub2_physical_slot
   c1:
     type: logical
+    replication_mode: async
     publisher: publisher
     subscriber: subscriber
     tables: all
@@ -67,12 +70,14 @@ clusters:
     failover: true
   c2:
     type: streaming
+    replication_mode: async
     primary: c21
     standbys:
       - node: c22
         slot: c22_physical_slot
   c3:
     type: logical
+    replication_mode: async
     publisher: c31
     subscriber: c32
     tables: all

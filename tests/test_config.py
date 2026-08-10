@@ -44,6 +44,29 @@ class ConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(ConfigError, "必须是布尔值"):
             Config("memory.yaml", raw)
 
+    def test_replication_mode_defaults_to_async(self):
+        config = Config("memory.yaml", deepcopy(self.raw))
+        self.assertEqual(config.replication_mode("c1"), "async")
+
+    def test_invalid_replication_mode_is_rejected(self):
+        raw = deepcopy(self.raw)
+        raw["clusters"]["c2"]["replication_mode"] = "automatic"
+        with self.assertRaisesRegex(ConfigError, "async 或 sync"):
+            Config("memory.yaml", raw)
+
+    def test_sync_streaming_requires_standby(self):
+        raw = deepcopy(self.raw)
+        raw["clusters"]["c2"]["replication_mode"] = "sync"
+        raw["clusters"]["c2"]["standbys"] = []
+        with self.assertRaisesRegex(ConfigError, "至少需要一个备库"):
+            Config("memory.yaml", raw)
+
+    def test_synchronous_commit_requires_sync_mode(self):
+        raw = deepcopy(self.raw)
+        raw["clusters"]["c3"]["synchronous_commit"] = "remote_apply"
+        with self.assertRaisesRegex(ConfigError, "仅能在"):
+            Config("memory.yaml", raw)
+
     def test_failover_requires_publisher_standby(self):
         raw = deepcopy(self.raw)
         raw["clusters"]["c3"]["failover"] = True

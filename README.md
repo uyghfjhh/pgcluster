@@ -5,6 +5,7 @@
 - 单节点实例；
 - 带物理复制槽的流复制集群；
 - 两个节点之间的简单逻辑复制；
+- 流复制和逻辑复制的同步/异步模式；
 - 两套流复制集群之间的逻辑复制和 PostgreSQL 17+ 原生故障转移槽；
 - 本机和 SSH 远程主机；
 - 依赖检查、幂等创建、健康检查和安全清理。
@@ -74,6 +75,24 @@ subscription、逻辑槽和故障槽同步状态。集群为 `FAILED` 时命令�
 修改命令使用配置级文件锁，避免两个 pgcluster 进程同时操作同一套环境。
 
 `operation.log` 每次覆盖，记录实际执行的本机/SSH命令、SQL、文件写入内容、输出和退出码。
+
+## 同步与异步复制
+
+流复制和逻辑复制都使用同一个字段；未配置时默认为 `async`：
+
+```yaml
+replication_mode: async
+```
+
+同步复制配置为：
+
+```yaml
+replication_mode: sync
+synchronous_commit: remote_apply
+```
+
+`synchronous_commit` 可选 `remote_write`、`on` 或 `remote_apply`，默认
+`remote_apply`。同步集群中的任一备库/订阅端停止都会阻塞发布端的事务提交。
 
 ## 测试
 

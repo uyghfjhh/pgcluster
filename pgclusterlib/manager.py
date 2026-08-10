@@ -69,13 +69,16 @@ class Manager:
     def graph(self, target):
         order = self.config.topology.action_order(target)
         root = self.config.cluster(target)
-        lines = ["CLUSTER %s [%s]" % (target, root["type"])]
+        mode = self.config.replication_mode(target) if root["type"] in {"streaming", "logical"} else None
+        label = "%s, %s" % (root["type"], mode) if mode else root["type"]
+        lines = ["CLUSTER %s [%s]" % (target, label)]
 
         def streaming_lines(name, prefix="", last=True, include_name=True):
             cluster = self.config.cluster(name)
             if include_name:
                 branch = "└──" if last else "├──"
-                lines.append("%s%s %s [streaming]" % (prefix, branch, name))
+                lines.append("%s%s %s [streaming, %s]" % (
+                    prefix, branch, name, self.config.replication_mode(name)))
                 prefix += "    " if last else "│   "
             members = [("primary", cluster["primary"])]
             members.extend(("standby", standby["node"]) for standby in cluster.get("standbys") or [])
@@ -395,7 +398,73 @@ class Manager:
         # settings describe the old primary's downstream standbys and must not
         # survive on a promoted copy.
         self.psql(standby, "ALTER SYSTEM RESET synchronized_standby_slots")
+        self.psql(standby, "ALTER SYSTEM RESET synchronous_standby_names")
+        self.psql(standby, "ALTER SYSTEM RESET synchronous_commit")
         self.psql(standby, "SELECT pg_reload_conf()")
+
+    def _active_logical_sync_clusters(self, publisher):
+        """Return configured synchronous logical links whose subscription exists.
+
+        A subscription is deliberately not added before it exists: doing so
+        would make publisher commits wait forever while create is still trying
+        to build the subscriber side.
+        """
+        active = []
+        for name, cluster in self.config.clusters.items():
+            if cluster.get("type") != "logical" or self.config.replication_mode(name) != "sync":
+                continue
+            if self.config.logical_node(name, "publisher") != publisher:
+                continue
+            subscriber = self.config.logical_node(name, "subscriber")
+            names = self.config.logical_names(name)
+            try:
+                enabled = self.psql(
+                    subscriber,
+                    "SELECT count(*) FROM pg_subscription WHERE subname = %s AND subenabled" %
+                    quote_literal(names["subscription"]),
+                    cluster.get("database", "postgres"),
+                    tuples=True,
+                )
+            except OperationError:
+                continue
+            if enabled == "1":
+                active.append(name)
+        return active
+
+    def _apply_synchronous_replication(self, publisher):
+        targets = []
+        commit_levels = []
+        for name, cluster in self.config.clusters.items():
+            if cluster.get("type") != "streaming" or cluster.get("primary") != publisher:
+                continue
+            if self.config.replication_mode(name) == "sync":
+                targets.extend(item["node"] for item in cluster.get("standbys") or [])
+                commit_levels.append(self.config.synchronous_commit(name))
+        for name in self._active_logical_sync_clusters(publisher):
+            targets.append(self.config.logical_names(name)["subscription"])
+            commit_levels.append(self.config.synchronous_commit(name))
+
+        if not targets:
+            self.psql(publisher, "ALTER SYSTEM RESET synchronous_standby_names")
+            self.psql(publisher, "ALTER SYSTEM RESET synchronous_commit")
+        else:
+            # Waiting for every explicitly synchronous destination gives sync
+            # an unambiguous meaning even when physical and logical links share
+            # one publisher.
+            standby_names = "FIRST %s (%s)" % (
+                len(targets), ", ".join(quote_ident(item) for item in targets)
+            )
+            strength = {"remote_write": 0, "on": 1, "remote_apply": 2}
+            commit = max(commit_levels, key=strength.get)
+            self.psql(
+                publisher,
+                "ALTER SYSTEM SET synchronous_standby_names = %s" % quote_literal(standby_names),
+            )
+            self.psql(
+                publisher,
+                "ALTER SYSTEM SET synchronous_commit = %s" % quote_literal(commit),
+            )
+        self.psql(publisher, "SELECT pg_reload_conf()")
 
     def _create_streaming(self, cluster_name, publisher, sync_slots=False):
         cluster = self.config.cluster(cluster_name)
@@ -453,6 +522,7 @@ class Manager:
             )
             self._start(standby_name)
             self._reset_inherited_primary_settings(standby_name)
+        self._apply_synchronous_replication(primary)
 
     def _create_logical(self, cluster_name):
         cluster = self.config.cluster(cluster_name)
@@ -477,8 +547,9 @@ class Manager:
             self.config, self._provider_psql, cluster_name, publisher, database
         )
         publisher_node = self.config.node(publisher)
-        connection = "host=%s port=%s user=postgres dbname=%s" % (
-            self._host_address(publisher), publisher_node["port"], database)
+        connection = "host=%s port=%s user=postgres dbname=%s application_name=%s" % (
+            self._host_address(publisher), publisher_node["port"], database,
+            names["subscription"])
         sql = (
             "CREATE SUBSCRIPTION %s CONNECTION %s PUBLICATION %s "
             "WITH (connect = true, create_slot = false, enabled = true, "
@@ -501,6 +572,7 @@ class Manager:
             self.psql(subscriber, sql, database)
         else:
             self.psql(subscriber, "ALTER SUBSCRIPTION %s ENABLE" % quote_ident(names["subscription"]), database)
+        self._apply_synchronous_replication(publisher)
         self._wait_for_slot_sync(cluster_name)
 
     def _wait_for_slot_sync(self, logical_name, seconds=30):
@@ -583,7 +655,9 @@ class Manager:
             return "%-48s %s" % (label, state)
 
         root_kind = root["type"]
-        lines = [line("CLUSTER %s [%s]" % (target, root_kind), "OK" if root_ok else "FAILED")]
+        mode = self.config.replication_mode(target) if root_kind in {"streaming", "logical"} else None
+        label = "%s, %s" % (root_kind, mode) if mode else root_kind
+        lines = [line("CLUSTER %s [%s]" % (target, label), "OK" if root_ok else "FAILED")]
 
         groups = self.config.topology.groups(target)
         for group_index, group in enumerate(groups):
@@ -593,7 +667,10 @@ class Manager:
             group_indent = "    " if last_group else "│   "
             show_group = root["type"] == "logical"
             if show_group:
-                kind = "streaming" if group.explicit else "single"
+                kind = (
+                    "streaming, %s" % self.config.replication_mode(group.name)
+                    if group.explicit else "single"
+                )
                 lines.append(line("%s %s [%s]" % (group_branch, group.name, kind),
                                   "OK" if health.ok else "FAILED"))
             else:
