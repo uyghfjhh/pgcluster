@@ -12,6 +12,8 @@
 
 FBase 故障槽、等保插件和 MMR 暂未实现，接口已经隔离，配置使用时会明确报错。
 
+当前完成情况和后续任务见 [开发进度](docs/PROGRESS.md)。
+
 ## 使用
 
 仓库内的 [pgcluster.yaml](pgcluster.yaml) 包含三个拓扑：
