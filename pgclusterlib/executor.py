@@ -7,7 +7,16 @@ from pathlib import Path
 from .errors import OperationError
 
 
-LOCAL_HOSTS = {"127.0.0.1", "::1", "localhost", socket.gethostname(), socket.getfqdn()}
+# Do not resolve the local FQDN here.  On a host without reverse DNS that
+# lookup can delay every command invocation by several seconds.
+LOCAL_HOSTS = {"127.0.0.1", "::1", "localhost", socket.gethostname()}
+
+
+def shell_join(args):
+    join = getattr(shlex, "join", None)
+    if join:
+        return join(args)
+    return " ".join(shlex.quote(str(item)) for item in args)
 
 
 class OperationLog:
@@ -42,11 +51,11 @@ class Executor:
 
     def run(self, args, host="local", cwd=None, check=True, stdin=None):
         args = [str(item) for item in args]
-        display = shlex.join(args)
+        display = shell_join(args)
         remote = host != "local" and not self.is_local(host)
         if remote:
             display = "ssh %s -- %s" % (shlex.quote(host), display)
-            actual = ["ssh", host, "--", shlex.join(args)]
+            actual = ["ssh", host, "--", shell_join(args)]
             actual_cwd = None
         else:
             actual = args
@@ -56,7 +65,7 @@ class Executor:
                 actual,
                 cwd=actual_cwd,
                 input=stdin,
-                text=True,
+                universal_newlines=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )

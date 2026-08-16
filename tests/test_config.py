@@ -1,4 +1,3 @@
-import os
 import unittest
 from copy import deepcopy
 from pathlib import Path
@@ -9,101 +8,58 @@ from pgclusterlib.config import Config, load
 from pgclusterlib.errors import ConfigError
 
 
-class ConfigTest(unittest.TestCase):
+class ConfigModelTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.root = Path(__file__).parents[1]
         cls.raw = yaml.safe_load((cls.root / "pgcluster.yaml").read_text(encoding="utf-8"))
 
-    def test_complete_example_validates(self):
-        root = Path(__file__).parents[1]
-        config = load(root / "pgcluster.yaml")
-        self.assertEqual(config.closure("c1"), ["publisher", "subscriber", "c1"])
-        self.assertEqual(config.logical_names("c1")["slot"], "c1_failover_slot")
-        self.assertEqual(config.closure("c3"), ["c3"])
-        self.assertEqual(config.logical_node("c3", "publisher"), "c31")
-        self.assertEqual(config.logical_node("c3", "subscriber"), "c32")
-        self.assertEqual(config.topology.action_order("c3"), ["c31", "c32", "c3"])
-        self.assertEqual(config.topology.external_dependents("publisher"), ["c1"])
+    def test_complete_config_validates(self):
+        config = load(self.root / "pgcluster.yaml")
+        self.assertIsInstance(config, Config)
+        self.assertNotIn("schema_version", config.raw)
+        self.assertEqual(config.validate("streaming.basic_cluster"), "配置有效: streaming.basic_cluster")
+        self.assertEqual(config.validate("logical.pub_sub"), "配置有效: logical.pub_sub")
+        self.assertEqual(config.validate("citus.citus_cluster"), "配置有效: citus.citus_cluster")
+        self.assertEqual(config.validate("mmr.mmr_cluster"), "配置有效: mmr.mmr_cluster")
 
-    def test_environment_value_is_whole_field(self):
-        original = os.environ.get("PGDATA1")
-        os.environ["PGDATA1"] = "/tmp/example"
-        try:
-            config = load(Path(__file__).parents[1] / "pgcluster.yaml")
-            self.assertEqual(config.node("pub1")["data_dir"], "/tmp/example")
-        finally:
-            if original is None:
-                os.environ.pop("PGDATA1", None)
-            else:
-                os.environ["PGDATA1"] = original
+    def test_transport_is_inferred(self):
+        config = load(self.root / "pgcluster.yaml")
+        self.assertNotIn("transport", config.hosts["pg17_host"])
+        self.assertNotIn("transport", config.hosts["fbase15_host"])
 
-    def test_logical_boolean_must_be_boolean(self):
+    def test_invalid_citus_factor_is_rejected(self):
         raw = deepcopy(self.raw)
-        raw["clusters"]["c3"]["failover"] = "false"
-        with self.assertRaisesRegex(ConfigError, "必须是布尔值"):
+        raw["citus_clusters"]["citus_cluster"]["postgresql_config"]["parameters"][
+            "citus.shard_replication_factor"
+        ] = 3
+        with self.assertRaisesRegex(ConfigError, "shard_replication_factor"):
             Config("memory.yaml", raw)
 
-    def test_replication_mode_defaults_to_async(self):
-        config = Config("memory.yaml", deepcopy(self.raw))
-        self.assertEqual(config.replication_mode("c1"), "async")
-
-    def test_invalid_replication_mode_is_rejected(self):
+    def test_invalid_mmr_streaming_mode_is_rejected(self):
         raw = deepcopy(self.raw)
-        raw["clusters"]["c2"]["replication_mode"] = "automatic"
-        with self.assertRaisesRegex(ConfigError, "async 或 sync"):
+        raw["mmr_clusters"]["mmr_cluster"]["members"]["node_a"]["mmr_node"]["streaming"] = "serial"
+        with self.assertRaisesRegex(ConfigError, "streaming 无效"):
             Config("memory.yaml", raw)
 
-    def test_sync_streaming_requires_standby(self):
+    def test_duplicate_instance_endpoint_is_rejected(self):
         raw = deepcopy(self.raw)
-        raw["clusters"]["c2"]["replication_mode"] = "sync"
-        raw["clusters"]["c2"]["standbys"] = []
-        with self.assertRaisesRegex(ConfigError, "至少需要一个备库"):
+        raw["instances"]["duplicate_node"] = deepcopy(raw["instances"]["basic_primary_node"])
+        with self.assertRaisesRegex(ConfigError, "重复实例端口"):
             Config("memory.yaml", raw)
 
-    def test_synchronous_commit_requires_sync_mode(self):
+    def test_relative_plugin_source_is_rejected(self):
         raw = deepcopy(self.raw)
-        raw["clusters"]["c3"]["synchronous_commit"] = "remote_apply"
-        with self.assertRaisesRegex(ConfigError, "仅能在"):
+        raw["postgresql_installations"]["fbase15"]["plugins"]["fbase_mac"]["source_dir"] = "contrib/fbase_mac"
+        with self.assertRaisesRegex(ConfigError, "source_dir 必须是绝对路径"):
             Config("memory.yaml", raw)
 
-    def test_failover_requires_publisher_standby(self):
+    def test_license_data_file_must_stay_in_pgdata(self):
         raw = deepcopy(self.raw)
-        raw["clusters"]["c3"]["failover"] = True
-        with self.assertRaisesRegex(ConfigError, "带备库"):
+        raw["postgresql_installations"]["fbase15"]["license"]["data_file"] = "../license.dat"
+        with self.assertRaisesRegex(ConfigError, "PGDATA 内的文件名"):
             Config("memory.yaml", raw)
 
-    def test_node_and_cluster_names_cannot_overlap(self):
-        raw = deepcopy(self.raw)
-        raw["clusters"]["c31"] = {"type": "streaming", "primary": "c21"}
-        with self.assertRaisesRegex(ConfigError, "不能重复"):
-            Config("memory.yaml", raw)
 
-    def test_duplicate_standby_is_rejected(self):
-        raw = deepcopy(self.raw)
-        raw["clusters"]["c2"]["standbys"].append(
-            {"node": "c22", "slot": "another_slot"}
-        )
-        with self.assertRaisesRegex(ConfigError, "重复节点"):
-            Config("memory.yaml", raw)
-
-    def test_duplicate_physical_slot_is_rejected(self):
-        raw = deepcopy(self.raw)
-        raw["nodes"]["c23"] = {
-            "host": "host1",
-            "port": 16434,
-            "data_dir": "/data/c2/c23",
-        }
-        raw["clusters"]["c2"]["standbys"].append(
-            {"node": "c23", "slot": "c22_physical_slot"}
-        )
-        with self.assertRaisesRegex(ConfigError, "重复物理槽"):
-            Config("memory.yaml", raw)
-
-    def test_same_data_dir_is_allowed_on_different_hosts(self):
-        raw = deepcopy(self.raw)
-        raw["hosts"]["host2"] = "192.0.2.2"
-        raw["nodes"]["c31"]["host"] = "host2"
-        raw["nodes"]["c31"]["data_dir"] = raw["nodes"]["c21"]["data_dir"]
-        config = Config("memory.yaml", raw)
-        self.assertEqual(config.node("c31")["host"], "host2")
+if __name__ == "__main__":
+    unittest.main()

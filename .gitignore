@@ -20,6 +20,7 @@ operation.log
 .env
 pgcluster.local.yaml
 .pgcluster.yaml.lock
+.*.state.json
 data/
 
 # IDE and operating-system files
