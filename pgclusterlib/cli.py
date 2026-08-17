@@ -1,21 +1,27 @@
 import argparse
+import os
 import sys
 import time
+from pathlib import Path
 
 from .config import load
 from .errors import PgClusterError
 from .locking import configuration_lock
 from .runtime import Runtime
+from . import tui
 
 
 def parser():
     result = argparse.ArgumentParser(prog="pgcluster")
-    result.add_argument("-f", "--file", default="pgcluster.yaml", help="配置文件（默认 ./pgcluster.yaml）")
+    result.add_argument("-f", "--file", help="配置文件（默认优先 ./pgcluster.local.yaml，再回退 ./pgcluster.yaml）")
     sub = result.add_subparsers(dest="command")
     validate = sub.add_parser("validate")
     validate.add_argument("target", help="目标，例如 citus.citus_cluster")
     graph = sub.add_parser("graph")
     graph.add_argument("target", help="目标，例如 citus.citus_cluster")
+    listing = sub.add_parser("list", help="以表格列出配置集群及实例状态")
+    help_command = sub.add_parser("help", help="显示全部或指定命令的帮助")
+    help_command.add_argument("topic", nargs="?", help="命令名，例如 create、list、status")
     doctor = sub.add_parser("doctor")
     doctor.add_argument("instance", nargs="?", help="实例名；省略则检查全部实例")
     install = sub.add_parser("install")
@@ -55,24 +61,51 @@ def parser():
     monitor.add_argument("target", help="实例或集群目标")
     monitor.add_argument("--once", action="store_true", help="只检查一次")
     monitor.add_argument("--interval", type=float, default=5.0, help="检查间隔秒数（默认 5）")
+    tui_command = sub.add_parser("tui", help="启动实时集群监控界面")
+    tui_command.add_argument("target", nargs="?", help="可选集群目标，例如 logical.pub_sub")
+    tui_command.add_argument("--refresh", type=float, default=3.0, help="刷新间隔秒数（默认 3）")
+    tui_command.add_argument("--once", action="store_true", help="只渲染一次后退出")
+    tui_command.add_argument("--text", action="store_true", help="使用无依赖文本监控界面")
     create = sub.add_parser("create")
     create.add_argument("target", help="目标，例如 streaming.basic_cluster")
     return result
 
 
 def main(argv=None):
-    args = parser().parse_args(argv)
+    command_parser = parser()
+    args = command_parser.parse_args(argv)
     try:
         if not args.command:
             raise PgClusterError("必须指定命令")
-        config = load(args.file)
+        if args.command == "help":
+            if not args.topic:
+                print(command_parser.format_help())
+                return 0
+            choices = next(action for action in command_parser._subparsers._group_actions).choices
+            if args.topic not in choices:
+                raise PgClusterError("未知命令: %s" % args.topic)
+            print(choices[args.topic].format_help())
+            return 0
+        config_path = Path(args.file) if args.file else Path("pgcluster.local.yaml")
+        if args.file is None and not config_path.exists():
+            config_path = Path("pgcluster.yaml")
+        config = load(config_path)
         if args.command == "validate":
             print(config.validate(args.target))
             return 0
         if args.command == "graph":
             print(config.graph(args.target))
             return 0
-        runtime = Runtime(config)
+        if args.command == "list":
+            deployment = Runtime(config).deployment_states()
+            use_color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+            print("配置文件: %s" % config.path)
+            print()
+            print(config.list_tree(deployment=deployment, color=use_color))
+            return 0
+        runtime = Runtime(config, progress=lambda message: print("==> %s" % message, flush=True))
+        if args.command == "tui":
+            return tui.run(config, runtime, args.refresh, args.once, args.text, args.target)
         if args.command == "doctor":
             names = [args.instance] if args.instance else sorted(config.instances)
             healthy = True
@@ -87,10 +120,35 @@ def main(argv=None):
                 print(runtime.install_installation(args.installation, args.force))
             return 0
         if args.command == "status":
-            result = runtime.status_target(args.target)
-            for name, state in result.items():
-                print("%s: %s%s" % (name, "running" if state["running"] else "stopped",
-                                    (" (%s)" % state["message"]) if state["message"] else ""))
+            result = runtime.status_display(args.target)
+            running = [state["running"] for state in result.values()]
+            if any(value is None for value in running):
+                summary = "未知"
+            elif all(running):
+                summary = "运行中"
+            elif any(running):
+                summary = "部分停止"
+            else:
+                summary = "已停止"
+            use_color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+            if args.target in config.instances:
+                instance = config.instance(args.target)
+                state = result[args.target]
+                label = "运行中" if state["running"] is True else "已停止" if state["running"] is False else "未知"
+                colors = {"运行中": "\033[32m", "已停止": "\033[31m", "未知": "\033[90m"}
+                paint = (lambda value: "%s%s\033[0m" % (colors[label], value)) if use_color else (lambda value: value)
+                print("实例 %s [%s]" % (args.target, paint(label)))
+                print("├─ endpoint: %s:%s" % (instance["host_config"]["address"], instance["port"]))
+                print("└─ data: %s" % instance["data_dir"])
+            else:
+                print(config.list_tree(args.target, {args.target: summary}, color=use_color,
+                                       instance_status=result))
+            failures = [(name, state["message"]) for name, state in result.items()
+                        if state["running"] is None and state["message"]]
+            if failures:
+                print("\n探测信息")
+                for name, message in failures:
+                    print("- %s: %s" % (name, message))
             return 0
         if args.command == "health":
             result = runtime.health_target(args.target)

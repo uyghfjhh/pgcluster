@@ -96,9 +96,17 @@ class ConfigModel:
                 raise ConfigError("instances.%s 必须是对象" % name)
             host_name = instance.get("host")
             if host_name not in self.hosts:
-                raise ConfigError("instances.%s.host 引用了未知 host" % name)
-            if instance.get("installation") not in self.installations:
-                raise ConfigError("instances.%s.installation 引用了未知安装" % name)
+                raise ConfigError(
+                    "instances.%s.host=%r 未在 hosts 中定义；可用 host: %s" %
+                    (name, host_name, ", ".join(sorted(self.hosts)) or "无")
+                )
+            installation_name = instance.get("installation")
+            if installation_name not in self.installations:
+                raise ConfigError(
+                    "instances.%s.installation=%r 未在 postgresql_installations 中定义；可用安装: %s。"
+                    "请将该实例的 installation 改为可用名称，或补充对应安装定义。" %
+                    (name, installation_name, ", ".join(sorted(self.installations)) or "无")
+                )
             try:
                 port = int(instance.get("port"))
             except (TypeError, ValueError):
@@ -284,6 +292,93 @@ class ConfigModel:
             cluster = self.mmr_clusters[name]
             for member_name, member in cluster["members"].items():
                 lines.append("  member %s: %s" % (member_name, member["streaming_cluster"]))
+        return "\n".join(lines)
+
+    def list_tree(self, target=None, deployment=None, color=False, instance_status=None):
+        """Render the declared topology without probing hosts or instances."""
+        collections = self._collections()
+        if target:
+            self._target(collections, target)
+            targets = [target]
+        else:
+            referenced = set()
+            for link in self.logical_replications.values():
+                referenced.update((link["pub"]["streaming_cluster"], link["sub"]["streaming_cluster"]))
+            for cluster in self.citus_clusters.values():
+                referenced.add(cluster["coordinator"]["streaming_cluster"])
+                referenced.update(item["streaming_cluster"] for item in cluster["workers"].values())
+            for cluster in self.mmr_clusters.values():
+                referenced.update(item["streaming_cluster"] for item in cluster["members"].values())
+            targets = (["streaming.%s" % name for name in self.streaming_clusters if name not in referenced] +
+                       ["logical.%s" % name for name in self.logical_replications] +
+                       ["citus.%s" % name for name in self.citus_clusters] +
+                       ["mmr.%s" % name for name in self.mmr_clusters])
+
+        lines = []
+        colors = {"green": "\033[32m", "yellow": "\033[33m", "red": "\033[31m",
+                  "gray": "\033[90m", "cyan": "\033[36m", "blue": "\033[34m",
+                  "reset": "\033[0m"}
+        state_colors = {"已部署": "green", "部分部署": "yellow", "未部署": "red", "未知": "gray",
+                        "运行中": "green", "部分停止": "yellow", "已停止": "red"}
+        type_colors = {"streaming": "cyan", "logical": "cyan", "citus": "cyan", "mmr": "cyan"}
+        def paint(value, tone):
+            return "%s%s%s" % (colors[tone], value, colors["reset"]) if color else value
+
+        def streaming_members(cluster_name, prefix):
+            cluster = self.streaming_clusters[cluster_name]
+            members = [("primary", cluster["primary"])] + [
+                ("standby", item["instance"])
+                for item in cluster.get("standbys") or []
+            ]
+            for pos, (role, instance) in enumerate(members):
+                branch = "└─" if pos == len(members) - 1 else "├─"
+                config = self.instance(instance)
+                endpoint = "%s:%s" % (config["host_config"]["address"], config["port"])
+                status = ""
+                if instance_status is not None:
+                    running = instance_status.get(instance, {}).get("running")
+                    label = "运行中" if running is True else "已停止" if running is False else "未知"
+                    status = " [%s]" % paint(label, state_colors[label])
+                lines.append("%s%s %s: %s%s (%s)" %
+                             (prefix, branch, role, instance, status, endpoint))
+                data_prefix = prefix + ("│  " if pos != len(members) - 1 else "   ")
+                data_dir = paint(config["data_dir"], "blue")
+                lines.append("%s└─ data: %s" % (data_prefix, data_dir))
+
+        def streaming_reference(label, cluster_name, prefix, last):
+            branch = "└─" if last else "├─"
+            lines.append("%s%s %s: streaming.%s" % (prefix, branch, label, cluster_name))
+            streaming_members(cluster_name, prefix + ("   " if last else "│  "))
+
+        for index, item in enumerate(targets):
+            kind, name = item.split(".", 1)
+            if index:
+                lines.append("")
+            state = ""
+            if deployment is not None:
+                deployment_state = deployment.get(item, "未知")
+                state = " [%s]" % paint(deployment_state, state_colors.get(deployment_state, "gray"))
+            type_name = {"streaming": "流复制", "logical": "逻辑复制", "citus": "Citus", "mmr": "MMR"}[kind]
+            lines.append("%s [%s]%s" % (item, paint(type_name, type_colors[kind]), state))
+            if kind == "streaming":
+                streaming_members(name, "")
+            elif kind == "logical":
+                link = self.logical_replications[name]
+                streaming_reference("pub", link["pub"]["streaming_cluster"], "", False)
+                streaming_reference("sub", link["sub"]["streaming_cluster"], "", True)
+            elif kind == "citus":
+                cluster = self.citus_clusters[name]
+                references = [("coordinator", cluster["coordinator"]["streaming_cluster"])] + [
+                    ("worker %s" % worker, value["streaming_cluster"])
+                    for worker, value in cluster["workers"].items()
+                ]
+                for pos, (label, stream) in enumerate(references):
+                    streaming_reference(label, stream, "", pos == len(references) - 1)
+            else:
+                members = list(self.mmr_clusters[name]["members"].items())
+                for pos, (member, value) in enumerate(members):
+                    streaming_reference("member %s" % member, value["streaming_cluster"], "",
+                                        pos == len(members) - 1)
         return "\n".join(lines)
 
     def host(self, name):

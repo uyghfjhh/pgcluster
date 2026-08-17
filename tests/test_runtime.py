@@ -51,14 +51,14 @@ class RuntimeInstallTest(unittest.TestCase):
     def test_install_builds_missing_fbase_plugins(self):
         executor = PluginExecutor()
         result = Runtime(self.config, executor).install_installation("fbase15")
-        self.assertIn("fbase_mac@local: 已安装", result)
+        fbase_host = self.config.hosts["fbase15_host"]["address"]
+        self.assertIn("fbase_mac@%s: 已安装" % fbase_host, result)
         self.assertEqual(len([args for _, args in executor.commands if args[0] == "make"]), 3)
         self.assertEqual(len([args for _, args in executor.commands if args[:2] == ["sudo", "-n"]]), 3)
 
     def test_install_reports_missing_plugin_without_source(self):
         with self.assertRaisesRegex(OperationError, "未配置 source_dir"):
             Runtime(self.config, PluginExecutor()).install_installation("postgresql17")
-
 
 if __name__ == "__main__":
     unittest.main()

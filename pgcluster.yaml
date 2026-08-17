@@ -7,9 +7,9 @@ timeouts:
 hosts:
   # transport is inferred: local address uses direct execution; other hosts use SSH.
   pg17_host:
-    address: 192.168.0.15
-  fbase15_host:
     address: 127.0.0.1
+  fbase15_host:
+    address: 192.168.1.13
 
 postgresql_installations:
   postgresql17:

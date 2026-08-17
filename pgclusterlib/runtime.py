@@ -12,9 +12,14 @@ MARKER = ".pgcluster-managed"
 class Runtime:
     """Lifecycle, topology verification, and replication primitives."""
 
-    def __init__(self, config, executor=None):
+    def __init__(self, config, executor=None, progress=None):
         self.config = config
         self.executor = executor or Executor()
+        self.progress = progress
+
+    def _progress(self, message):
+        if self.progress:
+            self.progress(message)
 
     def _state_path(self):
         return self.config.path.with_name(".%s.state.json" % self.config.path.name)
@@ -107,6 +112,7 @@ class Runtime:
         install = self.config.installation(installation_name)
         home = install["home"]
         hosts = self._installation_hosts(installation_name)
+        self._progress("检查安装 %s 的插件前置条件" % installation_name)
         messages = []
         for plugin_name, plugin in (install.get("plugins") or {}).items():
             extension = plugin.get("extension")
@@ -115,8 +121,10 @@ class Runtime:
                 continue
             for host in hosts:
                 if self._plugin_installed(host, home, plugin) and not force:
+                    self._progress("插件 %s@%s 已安装，跳过" % (plugin_name, host))
                     messages.append("%s@%s: 已安装" % (plugin_name, host))
                     continue
+                self._progress("编译并安装插件 %s@%s" % (plugin_name, host))
                 source = plugin.get("source_dir")
                 if not source:
                     raise OperationError(
@@ -144,7 +152,12 @@ class Runtime:
             [install["home"] + "/bin/pg_ctl", "status", "-D", instance["data_dir"]],
             host=host, check=False,
         )
-        return {"running": result.returncode == 0, "message": (result.stdout or result.stderr).strip()}
+        return {
+            "running": result.returncode == 0,
+            # pg_ctl uses exit code 3 for a reachable, stopped instance.
+            "known": result.returncode in {0, 3},
+            "message": (result.stdout or result.stderr).strip(),
+        }
 
     def status_cluster(self, name):
         return {instance: self.status_instance(instance) for instance in self.config.cluster_instances(name)}
@@ -186,6 +199,74 @@ class Runtime:
     def status_target(self, target):
         return {name: self.status_instance(name) for name in self.target_instances(target)}
 
+    def status_display(self, target):
+        """Collect per-instance status while preserving individual probe errors."""
+        states = {}
+        for name in self.target_instances(target):
+            try:
+                state = self.status_instance(name)
+                if not state["known"]:
+                    state["running"] = None
+                states[name] = state
+            except OperationError as exc:
+                states[name] = {"running": None, "message": str(exc)}
+        return states
+
+    def deployment_states(self, target=None):
+        """Classify declared topology by the managed-data marker on each host."""
+        targets = []
+        collections = self.config._collections()
+        if target:
+            self._target_for_deployment(collections, target)
+            targets = [target]
+        else:
+            for kind, values in collections.items():
+                targets.extend("%s.%s" % (kind, name) for name in values)
+        names = []
+        for item in targets:
+            for instance in self.target_instances(item):
+                if instance not in names:
+                    names.append(instance)
+        instance_states = {}
+        for name in names:
+            instance = self.config.instance(name)
+            result = self.executor.run(
+                ["sh", "-c", 'test -d "$1" && test -e "$1/.pgcluster-managed"',
+                 "sh", instance["data_dir"]],
+                host=self._host(instance), check=False,
+            )
+            if result.returncode == 0:
+                instance_states[name] = "已部署"
+            elif result.stderr.strip():
+                instance_states[name] = "未知"
+            else:
+                instance_states[name] = "未部署"
+
+        states = {}
+        for kind, values in collections.items():
+            for name in values:
+                target = "%s.%s" % (kind, name)
+                if target not in targets:
+                    continue
+                members = [instance_states[item] for item in self.target_instances(target)]
+                if all(item == "已部署" for item in members):
+                    states[target] = "已部署"
+                elif any(item == "未知" for item in members):
+                    states[target] = "未知"
+                elif any(item == "已部署" for item in members):
+                    states[target] = "部分部署"
+                else:
+                    states[target] = "未部署"
+        return states
+
+    @staticmethod
+    def _target_for_deployment(collections, target):
+        if "." not in target:
+            raise OperationError("未知目标: %s" % target)
+        kind, name = target.split(".", 1)
+        if kind not in collections or name not in collections[kind]:
+            raise OperationError("未知目标: %s" % target)
+
     def start_instance(self, name):
         instance = self.config.instance(name)
         host = self._host(instance)
@@ -205,24 +286,33 @@ class Runtime:
 
     def start_target(self, target):
         names = self.target_instances(target)
+        self._progress("启动目标 %s" % target)
         for name in names:
             if not self._managed(name):
                 raise SafetyError("实例不是 pgcluster 创建的，拒绝启动: %s" % name)
             if not self.status_instance(name)["running"]:
+                self._progress("启动实例 %s" % name)
                 self.start_instance(name)
+            else:
+                self._progress("实例 %s 已运行，跳过" % name)
         return "已启动: %s" % target
 
     def stop_target(self, target):
         names = self.target_instances(target)
+        self._progress("停止目标 %s" % target)
         for name in names:
             if not self._managed(name):
                 raise SafetyError("实例不是 pgcluster 创建的，拒绝停止: %s" % name)
         for name in reversed(names):
             if self.status_instance(name)["running"]:
+                self._progress("停止实例 %s" % name)
                 self.stop_instance(name)
+            else:
+                self._progress("实例 %s 已停止，跳过" % name)
         return "已停止: %s" % target
 
     def restart_target(self, target):
+        self._progress("重启目标 %s" % target)
         self.stop_target(target)
         self.start_target(target)
         return "已重启: %s" % target
@@ -231,17 +321,22 @@ class Runtime:
         if not yes:
             raise SafetyError("clean 会删除 PGDATA；请使用 --yes")
         names = self.target_instances(target)
+        self._progress("校验目标 %s 的受管数据目录" % target)
         for name in names:
             if not self._managed(name):
                 raise SafetyError("实例不是 pgcluster 创建的，拒绝清理: %s" % name)
 
+        self._progress("删除目标 %s 的复制元数据" % target)
         self._teardown_metadata(target)
         for name in reversed(names):
             if self.status_instance(name)["running"]:
+                self._progress("停止实例 %s" % name)
                 self.stop_instance(name)
         for name in names:
             instance = self.config.instance(name)
+            self._progress("删除实例 %s 的数据目录" % name)
             self.executor.remove_tree(self._host(instance), instance["data_dir"])
+        self._progress("清理运行状态记录")
         self._clear_state(names)
         return "已清理: %s" % target
 
@@ -414,6 +509,7 @@ class Runtime:
         if len(candidates) != 1:
             raise OperationError("failover 要求恰好一个可提升备库: %s" % target)
         new_primary = candidates[0]
+        self._progress("校验切换目标 %s (%s -> %s)" % (target, old_primary, new_primary))
         if not self._managed(old_primary) or not self._managed(new_primary):
             raise SafetyError("主库或备库不是 pgcluster 管理的数据目录")
         if not self.status_instance(new_primary)["running"]:
@@ -423,9 +519,12 @@ class Runtime:
         if self.status_instance(old_primary)["running"]:
             instance = self.config.instance(old_primary)
             mode = "immediate" if force else "fast"
+            self._progress("停止旧主库 %s" % old_primary)
             self.executor.run([self._bin(old_primary, "pg_ctl"), "stop", "-D", instance["data_dir"], "-m", mode, "-w"], host=self._host(instance))
         new_instance = self.config.instance(new_primary)
+        self._progress("提升备库 %s 为主库" % new_primary)
         self.executor.run([self._bin(new_primary, "pg_ctl"), "promote", "-D", new_instance["data_dir"], "-w"], host=self._host(new_instance))
+        self._progress("等待新主库 %s 完成提升" % new_primary)
         until = time.monotonic() + 30
         while time.monotonic() < until:
             if self._psql(new_primary, "SELECT pg_is_in_recovery()", tuples=True) == "f":
@@ -457,18 +556,24 @@ class Runtime:
         slot = (standby_spec or {}).get("slot") or "%s_%s_slot" % (cluster_name, old_primary)
         source = self.config.instance(new_primary)
         destination = self.config.instance(old_primary)
+        self._progress("将旧主库 %s 重新加入 %s" % (old_primary, target))
         if self.status_instance(old_primary)["running"]:
+            self._progress("停止旧主库 %s" % old_primary)
             self.stop_instance(old_primary)
         if not self._managed(old_primary):
             raise SafetyError("旧主库数据目录不是 pgcluster 管理目录")
+        self._progress("删除旧主库 %s 的数据目录" % old_primary)
         self.executor.remove_tree(self._host(destination), destination["data_dir"])
         if self._psql(new_primary, "SELECT count(*) FROM pg_replication_slots WHERE slot_name=%s" % quote_literal(slot), tuples=True) == "0":
             self._psql(new_primary, "SELECT pg_create_physical_replication_slot(%s)" % quote_literal(slot))
+        self._progress("从新主库 %s 重建旧主库 %s" % (new_primary, old_primary))
         self.executor.run(["mkdir", "-p", str(Path(destination["data_dir"]).parent)], host=self._host(destination))
         self.executor.run([self._bin(old_primary, "pg_basebackup"), "-h", source["host_config"]["address"], "-p", str(source["port"]), "-U", "postgres", "-D", destination["data_dir"], "-R", "-X", "stream", "-S", slot], host=self._host(destination))
         self.executor.write_text(self._host(destination), self._marker(old_primary), json.dumps({"node": old_primary}) + "\n")
         self._write_config(old_primary, new_primary, slot)
+        self._progress("启动重新加入的备库 %s" % old_primary)
         self.start_instance(old_primary)
+        self._progress("等待备库 %s 就绪" % old_primary)
         self._wait(old_primary)
         state.setdefault("failovers", {}).setdefault(cluster_name, {})["rejoined"] = True
         self._save_state(state)
@@ -616,12 +721,16 @@ class Runtime:
     def create_streaming(self, cluster_name, extra=None):
         cluster = self.config.streaming_clusters[cluster_name]
         primary = self._primary(cluster_name)
+        self._progress("创建流复制集群 streaming.%s" % cluster_name)
+        self._progress("初始化主库 %s" % primary)
         self._init_primary(primary, extra=extra)
+        self._progress("等待主库 %s 就绪" % primary)
         self._wait(primary)
         for standby in cluster.get("standbys") or []:
             name = standby["instance"]
             if name == primary:
                 continue
+            self._progress("配置备库 %s" % name)
             slot = standby.get("slot") or "%s_%s_slot" % (cluster_name, name)
             instance, host = self.config.instance(name), self._host(self.config.instance(name))
             exists = self._psql(primary, "SELECT slot_type FROM pg_replication_slots WHERE slot_name=%s" % quote_literal(slot), tuples=True)
@@ -635,13 +744,16 @@ class Runtime:
             self._write_config(name, primary, slot, extra)
             if not self.status_instance(name)["running"]:
                 self.start_instance(name)
+            self._progress("等待备库 %s 就绪" % name)
             self._wait(name)
+        self._progress("流复制集群 streaming.%s 已就绪" % cluster_name)
         return "创建完成: streaming.%s" % cluster_name
 
     def create_logical(self, name):
         link = self.config.logical_replications[name]
         pub_cluster = link["pub"]["streaming_cluster"]
         sub_cluster = link["sub"]["streaming_cluster"]
+        self._progress("创建逻辑复制 logical.%s" % name)
         self.create_streaming(pub_cluster, {"wal_level": "logical", "max_replication_slots": 16,
                                             "max_wal_senders": 16, "max_logical_replication_workers": 8})
         self.create_streaming(sub_cluster, {"wal_level": "logical", "max_replication_slots": 16,
@@ -651,11 +763,13 @@ class Runtime:
         database = link["pub"].get("database", "postgres")
         publication, subscription = "%s_pub" % name, "%s_sub" % name
         slot = (link["sub"].get("slot") or {}).get("name") or "%s_slot" % name
+        self._progress("创建 publication %s" % publication)
         if self._psql(publisher, "SELECT count(*) FROM pg_publication WHERE pubname=%s" % quote_literal(publication), database, True) != "1":
             self._psql(publisher, "CREATE PUBLICATION %s FOR ALL TABLES" % quote_ident(publication), database)
         p = self.config.instance(publisher)
         conn = "host=%s port=%s user=postgres dbname=%s application_name=%s" % (p["host_config"]["address"], p["port"], database, subscription)
         exists = self._psql(subscriber, "SELECT count(*) FROM pg_subscription WHERE subname=%s" % quote_literal(subscription), database, True)
+        self._progress("创建或启用 subscription %s" % subscription)
         if exists != "1":
             failover = "true" if (link["sub"].get("slot") or {}).get("failover", False) else "false"
             self._psql(subscriber, "CREATE SUBSCRIPTION %s CONNECTION %s PUBLICATION %s WITH (slot_name=%s, failover=%s)" %
@@ -668,6 +782,8 @@ class Runtime:
     def create_citus(self, name):
         cluster = self.config.citus_clusters[name]
         names = [cluster["coordinator"]["streaming_cluster"]] + [v["streaming_cluster"] for v in cluster["workers"].values()]
+        self._progress("创建 Citus 集群 citus.%s" % name)
+        self._progress("检查 Citus 扩展前置条件")
         for streaming in names:
             primary = self._primary(streaming)
             instance = self.config.instance(primary)
@@ -681,6 +797,7 @@ class Runtime:
             self.create_streaming(streaming, extra)
         database = cluster.get("database", "postgres")
         coordinator = self._primary(names[0])
+        self._progress("启用 Citus 扩展")
         for streaming in names:
             primary = self._primary(streaming)
             self._psql(primary, "CREATE EXTENSION IF NOT EXISTS citus", database)
@@ -689,6 +806,8 @@ class Runtime:
             exists = self._psql(coordinator, "SELECT count(*) FROM pg_dist_node WHERE nodename=%s AND nodeport=%s" %
                                 (quote_literal(node["host_config"]["address"]), node["port"]), database, True)
             if exists == "0":
+                self._progress("向 Coordinator 注册 Worker %s:%s" %
+                               (node["host_config"]["address"], node["port"]))
                 self._psql(coordinator, "SELECT citus_add_node(%s,%s)" %
                            (quote_literal(node["host_config"]["address"]), node["port"]), database)
         return "创建完成: citus.%s" % name
@@ -697,6 +816,7 @@ class Runtime:
         cluster = self.config.mmr_clusters[name]
         extra = cluster.get("postgresql_config", {}).get("parameters", {})
         members = list(cluster["members"].items())
+        self._progress("创建 MMR 集群 mmr.%s" % name)
         for _, member in members:
             self.create_streaming(member["streaming_cluster"], extra)
         database = cluster.get("database", "postgres")
@@ -712,6 +832,7 @@ class Runtime:
         deferred_extensions = [item for item in cluster["extensions"] if item == "fbase_mac"]
         for _, member in members:
             node = self._primary(member["streaming_cluster"])
+            self._progress("配置 MMR 成员 %s" % member["node_name"])
             for extension in bootstrap_extensions:
                 self._psql(node, "CREATE EXTENSION IF NOT EXISTS %s" % quote_ident(extension), database)
             options = member.get("mmr_node") or {}
@@ -721,6 +842,7 @@ class Runtime:
             if exists == "0":
                 self._psql(node, "SELECT fdd.create_node(%s,%s,%s,%s,%s)" % (quote_literal(member["node_name"]), quote_literal(dsn), "true" if options.get("failover_slot", True) else "false", quote_literal(options.get("streaming", "off")), "true" if options.get("two_phase", False) else "false"), database)
         if self._psql(first_node, "SELECT count(*) FROM fdd.mmr_group WHERE group_name=%s" % quote_literal(cluster["group_name"]), database, True) == "0":
+            self._progress("创建 MMR 组 %s" % cluster["group_name"])
             self._psql(first_node, "SELECT fdd.create_group(%s)" % quote_literal(cluster["group_name"]), database)
         self._psql(first_node, "CREATE SCHEMA IF NOT EXISTS pgcluster; "
                    "CREATE TABLE IF NOT EXISTS pgcluster.mmr_probe "
@@ -729,6 +851,7 @@ class Runtime:
             node = self._primary(member["streaming_cluster"])
             join = member.get("join") or {}
             if self._psql(node, "SELECT count(*) FROM fdd.mmr_group WHERE group_name=%s" % quote_literal(cluster["group_name"]), database, True) == "0":
+                self._progress("将成员 %s 加入 MMR 组" % member["node_name"])
                 self._psql(node, "SELECT fdd.join_group(%s,%s,%s,%s,%s)" % (quote_literal(cluster["group_name"]), quote_literal(first_dsn), "true" if join.get("wait_for_completion", True) else "false", quote_literal(join.get("synchronize_structure", "all")), quote_literal(join.get("precheck", "table_exist_error"))), database)
         for _, member in members:
             node = self._primary(member["streaming_cluster"])

@@ -28,6 +28,12 @@ class ConfigModelTest(unittest.TestCase):
         self.assertNotIn("transport", config.hosts["pg17_host"])
         self.assertNotIn("transport", config.hosts["fbase15_host"])
 
+    def test_list_tree_expands_logical_replication(self):
+        tree = load(self.root / "pgcluster.yaml").list_tree("logical.pub_sub")
+        self.assertIn("logical.pub_sub [逻辑复制]", tree)
+        self.assertIn("pub: streaming.logical_pub_cluster", tree)
+        self.assertIn("sub: streaming.logical_sub_cluster", tree)
+
     def test_invalid_citus_factor_is_rejected(self):
         raw = deepcopy(self.raw)
         raw["citus_clusters"]["citus_cluster"]["postgresql_config"]["parameters"][
@@ -46,6 +52,12 @@ class ConfigModelTest(unittest.TestCase):
         raw = deepcopy(self.raw)
         raw["instances"]["duplicate_node"] = deepcopy(raw["instances"]["basic_primary_node"])
         with self.assertRaisesRegex(ConfigError, "重复实例端口"):
+            Config("memory.yaml", raw)
+
+    def test_unknown_installation_lists_the_available_names(self):
+        raw = deepcopy(self.raw)
+        raw["instances"]["basic_primary_node"]["installation"] = "postgresql18"
+        with self.assertRaisesRegex(ConfigError, "basic_primary_node.*postgresql18.*postgresql17"):
             Config("memory.yaml", raw)
 
     def test_relative_plugin_source_is_rejected(self):

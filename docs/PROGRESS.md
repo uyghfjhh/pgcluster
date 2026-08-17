@@ -2,35 +2,36 @@
 
 ## 当前状态
 
-项目只维护一套无版本字段的声明式配置模型。当前正式入口是 `pgcluster.yaml`，模型包含：
+项目维护一套不带版本字段的声明式 YAML 配置模型。默认配置优先级为
+`pgcluster.local.yaml`，其次是 `pgcluster.yaml`；显式 `-f/--file` 优先级最高。
 
-- PostgreSQL/FBase 安装、许可证和插件前置条件；
-- 单实例和流复制集群；
-- `pub`/`sub` 逻辑复制关系；
-- Coordinator/Worker 组成的 Citus 集群；
-- 每个成员引用流复制集群的 FBase MMR 集群。
+模型覆盖 PostgreSQL/FBase 安装、实例、物理流复制、逻辑复制、Citus 和 FBase MMR。
 
 ## 已完成
 
-- v2 YAML 结构校验；
-- 主机、安装、实例、端口和数据目录引用校验；
-- 流复制、逻辑复制、Citus、MMR 拓扑引用校验；
-- MMR `streaming`、故障槽、两阶段提交选项校验；
-- 主机连接方式推断：本机直连，其他地址默认 SSH；
-- `validate` 命令和对应单元测试。
-- `doctor`：检查实例目录、数据库工具、扩展控制文件和 FBase 许可证；缺项时返回非零。
-- `install <installation>`：在使用该安装的每台主机上构建并安装缺失插件，`--force` 可重装。
-- `create`：流复制、逻辑复制、Citus、MMR 实际创建；
-- `status`、`health`、`verify`：实例和四类集群检查；
-- `start`、`stop`、`restart`、`clean`：带 marker 校验和配置锁的生命周期操作；
-- `failover`、`switchover`、`rejoin`：流复制主备切换、旧主库重建回归；
-- `monitor --once` 和 `lag`：健康与复制进度检查；
-- 远程 PG17.2 Citus 编译安装与真实分布式表验证；
-- FBase MMR 许可证、插件、双向复制和等保元数据兼容处理。
+- 主机、安装、插件、许可证、实例、端口和数据目录校验
+- 流复制、逻辑复制、Citus、MMR 拓扑引用校验
+- 同步/异步复制、MMR streaming、故障槽和两阶段提交选项校验
+- 本机直连、远程 SSH 和操作日志
+- `validate`、`graph`、`list`、`help` 命令
+- `tui` 实时监控界面：部署关系图、集群健康卡片、实例状态、连接/TPS/缓存命中率和复制指标
+- `list` 的四个顶层集群树状展示、IP/端口/数据目录和部署标记状态
+- `doctor`：实例目录、数据库工具、扩展控制文件和 FBase 许可证检查
+- `install`：在使用安装的主机上构建和安装缺失插件，支持 `--force`
+- `create`：流复制、逻辑复制、Citus、MMR 创建及依赖编排
+- `status`、`health`、`verify`、`lag`、`monitor --once`
+- `start`、`stop`、`restart`、`clean`、`delete`
+- `failover`、`switchover`、`rejoin`
+- 修改型命令的阶段进度输出，避免长时间操作期间无反馈
+- 配置锁、PGDATA `.pgcluster-managed` 标记和危险操作确认
+- PostgreSQL/Citus 远程部署验证
+- FBase MMR 许可证、插件、双向复制和等保元数据兼容处理
+- 配置、执行器和运行时单元测试
 
-## 未完成
+## 已知限制
 
-- 自动故障检测和长期运行监控守护进程；
-- Citus 的 `source_dir` 尚未配置；目标主机缺少 Citus 时会明确报错，不能自动构建。
+- 没有自动故障检测和长期运行的监控守护进程
+- Citus 没有配置 `source_dir`，缺少 Citus 时只能报告前置条件不足
+- `list` 的部署状态依赖主机可达和 `.pgcluster-managed` 标记，不负责发现配置之外的数据库实例
 
-未实现的操作会直接报错，不会回退到旧配置格式。
+未实现的操作应直接报错，不回退到旧配置格式。
