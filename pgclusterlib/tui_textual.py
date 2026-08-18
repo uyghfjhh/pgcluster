@@ -39,16 +39,27 @@ def _stream_status(runtime, states, stream):
 def _node_card(config, runtime, states, stream, label, width=34):
     """Render a compact stream cluster as a web-like node card."""
     status = _stream_status(runtime, states, stream)
-    cluster = config.streaming_clusters[stream]
     primary = runtime._primary(stream)
     standbys = runtime._streaming_standbys(stream)
-    primary_info = config.instance(primary)
-    lines = ["[b]%s[/]" % label, "[cyan]%s[/]" % stream,
-             "[dim]primary[/]  %s" % primary,
-             "[dim]%s:%s[/]" % (primary_info["host_config"]["address"], primary_info["port"])]
-    if standbys:
-        lines.append("[dim]standby[/]  %s" % ", ".join(standbys))
-    lines.append("[%s]● %s[/]" % (_status_style(status), status))
+    def short_instance(value):
+        value = value.removesuffix("_node")
+        for prefix in ("logical_pub_", "logical_sub_", "citus_", "mmr_"):
+            if value.startswith(prefix):
+                value = value[len(prefix):]
+        return value
+
+    display_stream = stream
+    for prefix, replacement in (("logical_pub_", "pub_"), ("logical_sub_", "sub_"),
+                                ("citus_", ""), ("mmr_", "")):
+        if display_stream.startswith(prefix):
+            display_stream = replacement + display_stream[len(prefix):]
+            break
+
+    standby_text = ", ".join(short_instance(item) for item in standbys) if standbys else "-"
+    lines = ["[b]%s[/]  [cyan]%s[/]" % (label, display_stream),
+             "[%s]● %s[/]" % (_status_style(status), status),
+             "[dim]P[/] %s  [bright_cyan]──▶[/]  [dim]S[/] %s" %
+             (short_instance(primary), standby_text)]
     return Panel(Text.from_markup("\n".join(lines)), width=width,
                  border_style=_status_style(status), padding=(0, 1))
 
@@ -64,7 +75,7 @@ def _down_arrow(label="复制"):
 def _topology_renderable(config, runtime, states, clusters, width=100):
     """Build a card-and-arrow topology map using Rich renderables."""
     blocks = [Text("DEPLOYMENT MAP", style="bold bright_cyan"),
-              Text("节点卡片显示主备、地址和进程状态", style="dim")]
+              Text("P ──▶ S = 流复制       ⇢ = 逻辑复制       颜色 = 进程状态", style="dim")]
     for kind, target, status, _metric, _detail in clusters:
         name = target.split(".", 1)[1]
         title = "%s  %s" % (TYPE_NAMES[kind], target)
@@ -77,8 +88,8 @@ def _topology_renderable(config, runtime, states, clusters, width=100):
             sub = link["sub"]["streaming_cluster"]
             publisher = _node_card(config, runtime, states, pub, "PUBLISHER", card_width)
             subscriber = _node_card(config, runtime, states, sub, "SUBSCRIBER", card_width)
-            graph = (Columns([publisher, _arrow("发布"), subscriber], expand=False)
-                     if width >= 78 else Group(Align.left(publisher), _down_arrow("发布"), Align.left(subscriber)))
+            graph = (Columns([publisher, _arrow("逻辑复制"), subscriber], expand=False)
+                     if width >= 78 else Group(Align.left(publisher), _down_arrow("逻辑复制"), Align.left(subscriber)))
         elif kind == "citus":
             cluster = config.citus_clusters[name]
             coordinator = cluster["coordinator"]["streaming_cluster"]
