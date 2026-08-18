@@ -5,7 +5,7 @@ import time
 
 from rich.align import Align
 from rich.columns import Columns
-from rich.console import Group
+from rich.console import Console, Group
 from rich.markup import escape
 from rich.panel import Panel
 from rich.text import Text
@@ -127,16 +127,18 @@ def _metric_line(operational, detail, target, tps):
     connections = operational.get("connections", 0)
     max_connections = operational.get("max_connections") or "?"
     cache_hit = operational.get("cache_hit")
-    common = "connections=%s/%s | TPS=%.1f | cache_hit=%s" % (
+    common = "指标 连接=%s/%s | TPS=%.1f 次/秒 | 缓存命中=%s" % (
         connections, max_connections, tps,
         "%s%%" % cache_hit if cache_hit is not None else "未知")
     kind = target.split(".", 1)[0]
     if kind == "streaming":
-        extra = "%s | WAL lag=%s" % (detail.get("replication", "未知"), format_bytes(detail.get("lag_bytes")))
+        extra = "流复制=%s | WAL延迟=%s" % (detail.get("replication", "未知"), format_bytes(detail.get("lag_bytes")))
     elif kind == "logical":
-        extra = "%s | latest_lsn=%s" % (detail.get("replication", "未知"), detail.get("latest_lsn", "-"))
+        subscription = {"enabled": "启用", "disabled": "停用", "missing": "缺失"}.get(
+            detail.get("subscription"), "未知")
+        extra = "订阅=%s | 最新LSN=%s" % (subscription, detail.get("latest_lsn", "-"))
     else:
-        extra = detail.get("replication", "未知")
+        extra = detail.get("replication", "未知").replace("workers=", "Worker=").replace("active=", "活跃成员=")
     return "METRIC  %s | %s" % (common, extra)
 
 
@@ -207,7 +209,8 @@ class PgClusterApp(App):
     Screen { background: #10161c; color: #d8e2ea; }
     #topology { height: 1fr; margin: 1 2; padding: 1; border: round #2b7189; overflow: hidden; content-align: center middle; }
     """
-    BINDINGS = [("q", "quit", "退出"), ("r", "refresh_now", "刷新")]
+    BINDINGS = [("q", "quit", "退出"), ("r", "refresh_now", "刷新"),
+                ("c", "copy_map", "复制拓扑")]
 
     def __init__(self, config, runtime, refresh_seconds, once=False, target=None):
         super().__init__()
@@ -218,6 +221,7 @@ class PgClusterApp(App):
         self.target = target
         self.last_transactions = None
         self.last_sample_at = None
+        self.copy_text = ""
 
     def compose(self) -> ComposeResult:
         yield Static(id="topology")
@@ -257,6 +261,13 @@ class PgClusterApp(App):
     def action_refresh_now(self):
         self.refresh_dashboard()
 
+    def action_copy_map(self):
+        if not self.copy_text:
+            self.notify("拓扑尚未完成采样", severity="warning")
+            return
+        self.copy_to_clipboard(self.copy_text)
+        self.notify("部署图已复制到剪贴板", severity="information")
+
     @work(thread=True, exclusive=True)
     def refresh_dashboard(self):
         states, targets, operational, details = self._snapshot()
@@ -270,9 +281,12 @@ class PgClusterApp(App):
             tps = max(0, transactions - self.last_transactions) / max(1, now - self.last_sample_at)
         self.last_transactions = transactions
         self.last_sample_at = now
+        diagram = _deployment_map(self.config, self.runtime, states, targets, operational, details, tps)
+        plain = Console(record=True, width=max(120, self.size.width - 4), color_system=None)
+        plain.print(diagram)
+        self.copy_text = plain.export_text(styles=False).rstrip()
         self.query_one("#topology", Static).update(
-            Align.center(_deployment_map(self.config, self.runtime, states, targets, operational, details, tps),
-                         vertical="middle")
+            Align.center(diagram, vertical="middle")
         )
         if self.once:
             self.exit()
