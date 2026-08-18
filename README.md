@@ -170,6 +170,7 @@ python -m pip install -e '.[tui]'
 - [README.md](README.md)：项目定位、架构、配置和用户操作
 - [pgcluster.example.yaml](pgcluster.example.yaml)：可复制修改的完整配置示例
 - [docs/PROGRESS.md](docs/PROGRESS.md)：开发进度、已完成能力和已知限制
+- [docs/MONITORING.md](docs/MONITORING.md)：TUI 监控指标来源、公式、SQL 和解释
 - [docs/superpowers/specs/2026-07-28-pg-cluster-deployment-config-cli-design.md](docs/superpowers/specs/2026-07-28-pg-cluster-deployment-config-cli-design.md)：配置与 CLI 设计记录
 - `tests/`：配置、执行器和运行时单元测试
 
