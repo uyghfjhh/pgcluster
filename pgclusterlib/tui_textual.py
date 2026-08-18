@@ -3,6 +3,10 @@
 import time
 from collections import defaultdict, deque
 
+from rich.align import Align
+from rich.columns import Columns
+from rich.console import Group
+from rich.panel import Panel
 from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
@@ -10,6 +14,91 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import DataTable, Footer, Header, Static
 
 from .tui import _spark, format_bytes, snapshot
+
+
+TYPE_NAMES = {"streaming": "流复制", "logical": "逻辑复制", "citus": "Citus", "mmr": "MMR"}
+STATUS_STYLES = {"运行中": "green", "已部署": "green", "部分停止": "yellow",
+                 "已停止": "red", "未知": "grey70"}
+
+
+def _status_style(status):
+    return STATUS_STYLES.get(status, "grey70")
+
+
+def _stream_status(runtime, states, stream):
+    values = [states[item] for item in runtime.target_instances("streaming." + stream)]
+    if all(item["running"] is True for item in values):
+        return "运行中"
+    if any(item["running"] is None for item in values):
+        return "未知"
+    if any(item["running"] for item in values):
+        return "部分停止"
+    return "已停止"
+
+
+def _node_card(config, runtime, states, stream, label, width=34):
+    """Render a compact stream cluster as a web-like node card."""
+    status = _stream_status(runtime, states, stream)
+    cluster = config.streaming_clusters[stream]
+    primary = runtime._primary(stream)
+    standbys = runtime._streaming_standbys(stream)
+    primary_info = config.instance(primary)
+    lines = ["[b]%s[/]" % label, "[cyan]%s[/]" % stream,
+             "[dim]primary[/]  %s" % primary,
+             "[dim]%s:%s[/]" % (primary_info["host_config"]["address"], primary_info["port"])]
+    if standbys:
+        lines.append("[dim]standby[/]  %s" % ", ".join(standbys))
+    lines.append("[%s]● %s[/]" % (_status_style(status), status))
+    return Panel(Text.from_markup("\n".join(lines)), width=width,
+                 border_style=_status_style(status), padding=(0, 1))
+
+
+def _arrow(label="复制"):
+    return Text("\n\n  ─────▶\n\n%s" % label, style="bold bright_cyan", justify="center")
+
+
+def _down_arrow(label="复制"):
+    return Text("     │\n     ▼  %s" % label, style="bold bright_cyan")
+
+
+def _topology_renderable(config, runtime, states, clusters, width=100):
+    """Build a card-and-arrow topology map using Rich renderables."""
+    blocks = [Text("DEPLOYMENT MAP", style="bold bright_cyan"),
+              Text("节点卡片显示主备、地址和进程状态", style="dim")]
+    for kind, target, status, _metric, _detail in clusters:
+        name = target.split(".", 1)[1]
+        title = "%s  %s" % (TYPE_NAMES[kind], target)
+        card_width = 34 if width >= 78 else 26
+        if kind == "streaming":
+            graph = Columns([_node_card(config, runtime, states, name, "流复制集群", card_width)], expand=False)
+        elif kind == "logical":
+            link = config.logical_replications[name]
+            pub = link["pub"]["streaming_cluster"]
+            sub = link["sub"]["streaming_cluster"]
+            publisher = _node_card(config, runtime, states, pub, "PUBLISHER", card_width)
+            subscriber = _node_card(config, runtime, states, sub, "SUBSCRIBER", card_width)
+            graph = (Columns([publisher, _arrow("发布"), subscriber], expand=False)
+                     if width >= 78 else Group(Align.left(publisher), _down_arrow("发布"), Align.left(subscriber)))
+        elif kind == "citus":
+            cluster = config.citus_clusters[name]
+            coordinator = cluster["coordinator"]["streaming_cluster"]
+            workers = [("WORKER %s" % worker, item["streaming_cluster"])
+                       for worker, item in cluster["workers"].items()]
+            rows = [Columns([_node_card(config, runtime, states, coordinator, "COORDINATOR", card_width)], expand=False)]
+            rows.extend(Columns([Text("          │\n          ▼", style="bold bright_cyan"),
+                                 _node_card(config, runtime, states, stream, label, card_width)], expand=False)
+                        for label, stream in workers)
+            graph = Group(*rows)
+        else:
+            members = [("MEMBER %s" % member, item["streaming_cluster"])
+                       for member, item in config.mmr_clusters[name]["members"].items()]
+            nodes = [_node_card(config, runtime, states, stream, label, card_width)
+                     for label, stream in members]
+            graph = (Columns(nodes, expand=False) if width >= 78
+                     else Group(*[Align.left(node) for node in nodes]))
+        blocks.append(Panel(graph, title=title, title_align="left",
+                            border_style=_status_style(status), padding=(1, 1)))
+    return Group(*blocks)
 
 
 class PgClusterApp(App):
@@ -123,56 +212,19 @@ class PgClusterApp(App):
                      format_bytes(operational.get("max_lag_bytes")),
                      _spark(self.history["max_lag_bytes"])))
         self.query_one("#overview", Static).update(Text.from_markup(overview))
-        type_names = {"streaming": "流复制", "logical": "逻辑复制", "citus": "Citus", "mmr": "MMR"}
         cards = ["[b cyan]CLUSTER HEALTH[/]", "[dim]复制链路健康与当前延迟[/]", ""]
         for kind, target, status, metric, detail in clusters:
             tone = self._tone(status)
             lag_or_lsn = (format_bytes(detail.get("lag_bytes")) if detail.get("lag_bytes") is not None
                           else detail.get("latest_lsn") or "-")
-            cards.extend(("[%s]▌[/] [b]%s[/]  [%s]● %s[/]" % (tone, type_names[kind], tone, status),
+            cards.extend(("[%s]▌[/] [b]%s[/]  [%s]● %s[/]" % (tone, TYPE_NAMES[kind], tone, status),
                           "  [cyan]%s[/]" % target,
                           "  [dim]%s | %s[/]" % (detail.get("replication", metric), lag_or_lsn), ""))
         self.query_one("#cluster_cards_content", Static).update(Text.from_markup("\n".join(cards)))
-        topology = ["[b cyan]DEPLOYMENT GRAPH[/]", "[dim]箭头表示依赖和复制方向；颜色表示进程状态[/]", ""]
-        for kind, target, status, _, _detail in clusters:
-            topology.append("[dim]╭──────────────────────────────────────────────────────╮[/]")
-            topology.append("[%s]● %s[/]  [dim]%s[/]" % (self._tone(status), target, status))
-            kind_name, name = target.split(".", 1)
-            refs = []
-            if kind_name == "logical":
-                link = self.config.logical_replications[name]
-                refs = [("pub", link["pub"]["streaming_cluster"]), ("sub", link["sub"]["streaming_cluster"])]
-            elif kind_name == "citus":
-                cluster = self.config.citus_clusters[name]
-                refs = [("coordinator", cluster["coordinator"]["streaming_cluster"])] + [
-                    ("worker %s" % worker, value["streaming_cluster"])
-                    for worker, value in cluster["workers"].items()]
-            elif kind_name == "mmr":
-                refs = [("member %s" % member, value["streaming_cluster"])
-                        for member, value in self.config.mmr_clusters[name]["members"].items()]
-            if not refs and kind_name == "streaming":
-                refs = [("primary + standby", name)]
-            for pos, (label, stream) in enumerate(refs):
-                stream_target = "streaming.%s" % stream
-                stream_states = [states[item] for item in self.runtime.target_instances(stream_target)]
-                stream_status = "运行中" if all(s["running"] is True for s in stream_states) else \
-                    "未知" if any(s["running"] is None for s in stream_states) else "部分停止" if any(s["running"] for s in stream_states) else "已停止"
-                branch = "└─" if pos == len(refs) - 1 else "├─"
-                arrow = "──►"
-                topology.append("  %s %s %s [cyan]%s[/]  [%s]%s[/]" %
-                                (branch, label.ljust(12), arrow, stream, self._tone(stream_status), stream_status))
-                primary = self.runtime._primary(stream)
-                standbys = self.runtime._streaming_standbys(stream)
-                primary_endpoint = self.config.instance(primary)
-                topology.append("  %s    [dim]primary[/] %s [dim]%s:%s[/]" %
-                                ("│" if pos != len(refs) - 1 else " ", primary,
-                                 primary_endpoint["host_config"]["address"], primary_endpoint["port"]))
-                if standbys:
-                    topology.append("  %s    [dim]standby[/] %s" %
-                                    ("│" if pos != len(refs) - 1 else " ", ", ".join(standbys)))
-            topology.append("[dim]╰──────────────────────────────────────────────────────╯[/]")
-            topology.append("")
-        self.query_one("#topology_content", Static).update(Text.from_markup("\n".join(topology)))
+        topology_view = self.query_one("#topology", VerticalScroll)
+        self.query_one("#topology_content", Static).update(
+            _topology_renderable(self.config, self.runtime, states, clusters, topology_view.size.width)
+        )
         instance_table = self.query_one("#instances", DataTable)
         instance_table.clear()
         roles = {}
