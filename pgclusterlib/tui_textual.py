@@ -6,7 +6,7 @@ from collections import defaultdict, deque
 from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import DataTable, Footer, Header, Static
 
 from .tui import _spark, format_bytes, snapshot
@@ -19,11 +19,13 @@ class PgClusterApp(App):
     #title { height: 2; padding: 0 2; background: #17232d; color: #9de7f5; text-style: bold; }
     #overview { height: 6; margin: 0 2; padding: 1; border: round #8d6d2e; color: #f6d889; }
     #body { height: 1fr; padding: 1 2; }
-    #upper { height: 1fr; }
-    #topology { width: 62%; border: round #2b7189; padding: 1; color: #c7d7e4; overflow-y: auto; }
+    #upper { height: 2fr; min-height: 13; }
+    #topology { width: 62%; border: round #2b7189; padding: 1; color: #c7d7e4; }
+    #topology_content { padding: 0; }
     #right { width: 38%; margin-left: 1; }
-    #cluster_cards { height: 1fr; border: round #2b7189; padding: 1 2; overflow-y: auto; }
-    #instances { height: 2fr; min-height: 8; margin: 1 2; border: round #2b7189; }
+    #cluster_cards { height: 1fr; border: round #2b7189; padding: 1 2; }
+    #cluster_cards_content { padding: 0; }
+    #instances { height: 1fr; min-height: 6; margin: 1 2; border: round #2b7189; }
     DataTable { scrollbar-size: 1 1; }
     Footer { background: #17232d; color: #a8c5d3; }
     .ok { color: #55d98c; }
@@ -48,9 +50,11 @@ class PgClusterApp(App):
         with Vertical(id="body"):
           yield Static(id="overview")
           with Horizontal(id="upper"):
-            yield Static(id="topology")
+            with VerticalScroll(id="topology"):
+                yield Static(id="topology_content")
             with Vertical(id="right"):
-                yield Static(id="cluster_cards")
+                with VerticalScroll(id="cluster_cards"):
+                    yield Static(id="cluster_cards_content")
           yield DataTable(id="instances")
         yield Footer()
 
@@ -128,7 +132,7 @@ class PgClusterApp(App):
             cards.extend(("[%s]▌[/] [b]%s[/]  [%s]● %s[/]" % (tone, type_names[kind], tone, status),
                           "  [cyan]%s[/]" % target,
                           "  [dim]%s | %s[/]" % (detail.get("replication", metric), lag_or_lsn), ""))
-        self.query_one("#cluster_cards", Static).update(Text.from_markup("\n".join(cards)))
+        self.query_one("#cluster_cards_content", Static).update(Text.from_markup("\n".join(cards)))
         topology = ["[b cyan]DEPLOYMENT GRAPH[/]", "[dim]箭头表示依赖和复制方向；颜色表示进程状态[/]", ""]
         for kind, target, status, _, _detail in clusters:
             topology.append("[dim]╭──────────────────────────────────────────────────────╮[/]")
@@ -168,7 +172,7 @@ class PgClusterApp(App):
                                     ("│" if pos != len(refs) - 1 else " ", ", ".join(standbys)))
             topology.append("[dim]╰──────────────────────────────────────────────────────╯[/]")
             topology.append("")
-        self.query_one("#topology", Static).update(Text.from_markup("\n".join(topology)))
+        self.query_one("#topology_content", Static).update(Text.from_markup("\n".join(topology)))
         instance_table = self.query_one("#instances", DataTable)
         instance_table.clear()
         roles = {}
