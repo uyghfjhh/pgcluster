@@ -1,7 +1,5 @@
 """Full-screen deployment map for pgcluster."""
 
-import time
-
 from rich.columns import Columns
 from rich.console import Group
 from rich.panel import Panel
@@ -81,15 +79,11 @@ def _lane(title, status, content):
     return Panel(content, title=title, title_align="left", border_style=_tone(status), padding=(0, 1))
 
 
-def _deployment_map(config, runtime, states):
+def _deployment_map(config, runtime, states, targets):
     """Render all configured databases and their dependency relationships."""
-    blocks = [
-        Text("PGCLUSTER DEPLOYMENT MAP", style="bold bright_cyan", justify="center"),
-        Text("卡片内 P(primary) ──▶ S(standby) 是流复制；卡片之间的黄色箭头是上层集群关系。", style="dim", justify="center"),
-        Text("", justify="center"),
-    ]
-
-    standalone_streams = [target.split(".", 1)[1] for target in _topology_targets(config)
+    blocks = []
+    target_set = set(targets)
+    standalone_streams = [target.split(".", 1)[1] for target in targets
                           if target.startswith("streaming.")]
     for stream in standalone_streams:
         status = _stream_status(runtime, states, stream)
@@ -97,6 +91,8 @@ def _deployment_map(config, runtime, states):
                             Columns([_database_card(config, runtime, states, stream, "STREAMING DATABASE")], expand=False)))
 
     for name, link in config.logical_replications.items():
+        if "logical.%s" % name not in target_set:
+            continue
         pub = link["pub"]["streaming_cluster"]
         sub = link["sub"]["streaming_cluster"]
         statuses = [_stream_status(runtime, states, pub), _stream_status(runtime, states, sub)]
@@ -109,6 +105,8 @@ def _deployment_map(config, runtime, states):
                             ], expand=False)))
 
     for name, cluster in config.citus_clusters.items():
+        if "citus.%s" % name not in target_set:
+            continue
         coordinator = cluster["coordinator"]["streaming_cluster"]
         workers = [("WORKER %s" % worker, value["streaming_cluster"])
                    for worker, value in cluster["workers"].items()]
@@ -121,6 +119,8 @@ def _deployment_map(config, runtime, states):
         blocks.append(_lane("Citus  %s" % name, status, Columns(nodes, expand=False)))
 
     for name, cluster in config.mmr_clusters.items():
+        if "mmr.%s" % name not in target_set:
+            continue
         members = [("MMR MEMBER %s" % member, value["streaming_cluster"])
                    for member, value in cluster["members"].items()]
         statuses = [_stream_status(runtime, states, stream) for _label, stream in members]
@@ -138,7 +138,6 @@ def _deployment_map(config, runtime, states):
 class PgClusterApp(App):
     CSS = """
     Screen { background: #10161c; color: #d8e2ea; }
-    #title { height: 2; padding: 0 2; background: #102a36; color: #9de7f5; text-style: bold; }
     #topology { height: 1fr; margin: 1 2; padding: 1; border: round #2b7189; overflow: hidden; }
     """
     BINDINGS = [("q", "quit", "退出"), ("r", "refresh_now", "刷新")]
@@ -152,8 +151,16 @@ class PgClusterApp(App):
         self.target = target
 
     def compose(self) -> ComposeResult:
-        yield Static("PGCLUSTER DEPLOYMENT MAP | 正在读取配置...", id="title")
         yield Static(id="topology")
+
+    def _snapshot(self):
+        targets = _topology_targets(self.config, self.target)
+        names = []
+        for target in targets:
+            for name in self.runtime.target_instances(target):
+                if name not in names:
+                    names.append(name)
+        return _instance_states(self.config, self.runtime, names), targets
 
     def on_mount(self):
         if self.once:
@@ -163,8 +170,8 @@ class PgClusterApp(App):
             self.set_interval(self.refresh_seconds, self.refresh_dashboard)
 
     def refresh_once(self):
-        states = _instance_states(self.config, self.runtime)
-        self.apply_snapshot(states)
+        states, targets = self._snapshot()
+        self.apply_snapshot(states, targets)
         self.set_timer(0.15, self.exit)
 
     def action_quit(self):
@@ -175,18 +182,13 @@ class PgClusterApp(App):
 
     @work(thread=True, exclusive=True)
     def refresh_dashboard(self):
-        states = _instance_states(self.config, self.runtime)
-        self.call_from_thread(self.apply_snapshot, states)
+        states, targets = self._snapshot()
+        self.call_from_thread(self.apply_snapshot, states, targets)
 
-    def apply_snapshot(self, states):
-        up = sum(1 for item in states.values() if item["running"] is True)
-        down = sum(1 for item in states.values() if item["running"] is False)
-        unknown = len(states) - up - down
-        self.query_one("#title", Static).update(
-            "PGCLUSTER DEPLOYMENT MAP  |  全部数据库与复制关系  |  %s  |  %d up  %d down  %d unknown  |  %s" %
-            (self.config.path.name, up, down, unknown, time.strftime("%H:%M:%S"))
+    def apply_snapshot(self, states, targets):
+        self.query_one("#topology", Static).update(
+            _deployment_map(self.config, self.runtime, states, targets)
         )
-        self.query_one("#topology", Static).update(_deployment_map(self.config, self.runtime, states))
         if self.once:
             self.exit()
 
