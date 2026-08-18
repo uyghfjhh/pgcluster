@@ -1,5 +1,7 @@
 """Full-screen deployment map for pgcluster."""
 
+import re
+
 from rich.align import Align
 from rich.columns import Columns
 from rich.console import Group
@@ -53,23 +55,35 @@ def _short_instance(name):
     return name
 
 
+def _pid(state):
+    message = state.get("message", "") if state else ""
+    match = re.search(r"\bPID\s*:\s*(\d+)|\bpid\s*=\s*(\d+)", message, re.IGNORECASE)
+    return (match.group(1) or match.group(2)) if match else "-"
+
+
+def _machine(config, states, name):
+    instance = config.instance(name)
+    return "%s@%s:%s pid=%s" % (
+        _short_instance(name), instance["host_config"]["address"], instance["port"], _pid(states.get(name))
+    )
+
+
 def _database_card(config, runtime, states, stream, label):
     """A compact database-shaped node for a physical streaming pair."""
     status = _stream_status(runtime, states, stream)
     primary = runtime._primary(stream)
     standbys = runtime._streaming_standbys(stream)
-    primary_port = config.instance(primary)["port"]
     standby = standbys[0] if standbys else None
-    standby_label = "%s :%s" % (_short_instance(standby), config.instance(standby)["port"]) if standby else "-"
+    standby_label = _machine(config, states, standby) if standby else "-"
     content = Text.from_markup(
         "[b bright_cyan]▣ %s[/]\n"
         "[%s]● %s[/]\n"
-        "[b]P[/]  %s :%s\n"
+        "[b]P[/]  %s\n"
         "[bright_cyan]└─▶[/] [b]S[/]  %s" %
-        (label, _tone(status), status, _short_instance(primary), primary_port, standby_label)
+        (label, _tone(status), status, _machine(config, states, primary), standby_label)
     )
     return Panel(content, title="%s" % stream, title_align="left",
-                 border_style=_tone(status), width=34, padding=(0, 1))
+                 border_style=_tone(status), width=52, padding=(0, 1))
 
 
 def _relationship(label, symbol="════════▶"):
@@ -91,7 +105,7 @@ def _deployment_map(config, runtime, states, targets):
         status = _stream_status(runtime, states, stream)
         blocks.append(_lane("物理流复制  %s" % stream, status,
                             Columns([_database_card(config, runtime, states, stream, "STREAMING DATABASE")], expand=False),
-                            40))
+                            58))
 
     for name, link in config.logical_replications.items():
         if "logical.%s" % name not in target_set:
@@ -105,7 +119,7 @@ def _deployment_map(config, runtime, states, targets):
                                 _database_card(config, runtime, states, pub, "PUBLISHER DATABASE"),
                                 _relationship("LOGICAL REPLICATION"),
                                 _database_card(config, runtime, states, sub, "SUBSCRIBER DATABASE"),
-                            ], expand=False), 96))
+                            ], expand=False), 136))
 
     for name, cluster in config.citus_clusters.items():
         if "citus.%s" % name not in target_set:
@@ -119,7 +133,7 @@ def _deployment_map(config, runtime, states, targets):
         nodes = [_database_card(config, runtime, states, coordinator, "CITUS COORDINATOR")]
         nodes.append(_relationship("CITUS DISTRIBUTION"))
         nodes.extend(_database_card(config, runtime, states, stream, label) for label, stream in workers)
-        blocks.append(_lane("Citus  %s" % name, status, Columns(nodes, expand=False), 132))
+        blocks.append(_lane("Citus  %s" % name, status, Columns(nodes, expand=False), 178))
 
     for name, cluster in config.mmr_clusters.items():
         if "mmr.%s" % name not in target_set:
@@ -133,7 +147,7 @@ def _deployment_map(config, runtime, states, targets):
             if index:
                 nodes.append(_relationship("MMR MULTI-MASTER", "═══════↔"))
             nodes.append(_database_card(config, runtime, states, stream, label))
-        blocks.append(_lane("MMR  %s" % name, status, Columns(nodes, expand=False), 96))
+        blocks.append(_lane("MMR  %s" % name, status, Columns(nodes, expand=False), 136))
 
     return Group(*blocks)
 
