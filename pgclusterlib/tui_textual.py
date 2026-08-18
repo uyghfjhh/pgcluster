@@ -1,17 +1,21 @@
 """Full-screen deployment map for pgcluster."""
 
 import re
+import time
 
 from rich.align import Align
 from rich.columns import Columns
 from rich.console import Group
+from rich.markup import escape
 from rich.panel import Panel
 from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.widgets import Static
 
-from .tui import _instance_states, _topology_targets
+from .errors import OperationError
+from .tui import (_instance_states, _metrics, _operational_metrics,
+                  _topology_targets, format_bytes)
 
 
 STATUS_STYLES = {
@@ -62,8 +66,19 @@ def _pid(state):
 
 
 def _short_data_dir(value):
-    parts = str(value).rstrip("/").split("/")
-    return "…/" + "/".join(parts[-3:]) if len(parts) > 3 else str(value)
+    value = str(value).rstrip("/")
+    prefix = "PGDATA "
+    lines = []
+    remaining = value
+    while len(prefix) + len(remaining) > 40:
+        cut = remaining.rfind("/", 0, 40 - len(prefix) + 1)
+        if cut <= 0:
+            cut = 40 - len(prefix)
+        lines.append(prefix + remaining[:cut + 1])
+        remaining = remaining[cut + 1:]
+        prefix = "       "
+    lines.append(prefix + remaining)
+    return "\n".join(escape(line) for line in lines)
 
 
 def _database_node(config, states, name):
@@ -76,7 +91,7 @@ def _database_node(config, states, name):
         "[b bright_cyan]▣ %s[/]\n"
         "[%s]● %s[/]\n"
         "[dim]%s:%s  pid=%s[/]\n"
-        "[dim]PGDATA %s[/]" %
+        "[dim]%s[/]" %
         (_short_instance(name), _tone(status), status,
          instance["host_config"]["address"], instance["port"], _pid(state),
          _short_data_dir(instance["data_dir"]))
@@ -101,12 +116,31 @@ def _logical_arrow():
     return Text("  │\n  ▼  LOGICAL REPLICATION", style="bold yellow")
 
 
-def _lane(title, status, content, width):
+def _lane(title, status, content, width, metric=None):
+    if metric:
+        content = Group(Text(metric, style="dim"), content)
     return Panel(Align.center(content), title=title, title_align="left", border_style=_tone(status),
                  padding=(0, 1), width=width)
 
 
-def _deployment_map(config, runtime, states, targets):
+def _metric_line(operational, detail, target, tps):
+    connections = operational.get("connections", 0)
+    max_connections = operational.get("max_connections") or "?"
+    cache_hit = operational.get("cache_hit")
+    common = "connections=%s/%s | TPS=%.1f | cache_hit=%s" % (
+        connections, max_connections, tps,
+        "%s%%" % cache_hit if cache_hit is not None else "未知")
+    kind = target.split(".", 1)[0]
+    if kind == "streaming":
+        extra = "%s | WAL lag=%s" % (detail.get("replication", "未知"), format_bytes(detail.get("lag_bytes")))
+    elif kind == "logical":
+        extra = "%s | latest_lsn=%s" % (detail.get("replication", "未知"), detail.get("latest_lsn", "-"))
+    else:
+        extra = detail.get("replication", "未知")
+    return "METRIC  %s | %s" % (common, extra)
+
+
+def _deployment_map(config, runtime, states, targets, operational, details, tps):
     """Render all configured databases and their dependency relationships."""
     blocks = []
     target_set = set(targets)
@@ -115,7 +149,9 @@ def _deployment_map(config, runtime, states, targets):
     for stream in standalone_streams:
         status = _stream_status(runtime, states, stream)
         blocks.append(_lane("物理流复制  %s" % stream, status,
-                            _stream_pair(config, runtime, states, stream), 110))
+                            _stream_pair(config, runtime, states, stream), 110,
+                            _metric_line(operational, details.get("streaming.%s" % stream, {}),
+                                         "streaming.%s" % stream, tps)))
 
     for name, link in config.logical_replications.items():
         if "logical.%s" % name not in target_set:
@@ -127,7 +163,9 @@ def _deployment_map(config, runtime, states, targets):
         blocks.append(_lane("逻辑复制  %s" % name, status,
                             Group(_stream_pair(config, runtime, states, pub),
                                   _logical_arrow(),
-                                  _stream_pair(config, runtime, states, sub)), 110))
+                                  _stream_pair(config, runtime, states, sub)), 110,
+                            _metric_line(operational, details.get("logical.%s" % name, {}),
+                                         "logical.%s" % name, tps)))
 
     for name, cluster in config.citus_clusters.items():
         if "citus.%s" % name not in target_set:
@@ -141,7 +179,9 @@ def _deployment_map(config, runtime, states, targets):
         nodes = [_stream_pair(config, runtime, states, coordinator)]
         nodes.append(Text("     ╰═════════ CITUS DISTRIBUTION ═════════▶", style="bold yellow"))
         nodes.extend(_stream_pair(config, runtime, states, stream) for _label, stream in workers)
-        blocks.append(_lane("Citus  %s" % name, status, Group(*nodes), 110))
+        blocks.append(_lane("Citus  %s" % name, status, Group(*nodes), 110,
+                            _metric_line(operational, details.get("citus.%s" % name, {}),
+                                         "citus.%s" % name, tps)))
 
     for name, cluster in config.mmr_clusters.items():
         if "mmr.%s" % name not in target_set:
@@ -155,7 +195,9 @@ def _deployment_map(config, runtime, states, targets):
             if index:
                 nodes.append(Text("     ╰═════════ MMR MULTI-MASTER ═════════↔", style="bold yellow"))
             nodes.append(_stream_pair(config, runtime, states, stream))
-        blocks.append(_lane("MMR  %s" % name, status, Group(*nodes), 110))
+        blocks.append(_lane("MMR  %s" % name, status, Group(*nodes), 110,
+                            _metric_line(operational, details.get("mmr.%s" % name, {}),
+                                         "mmr.%s" % name, tps)))
 
     return Group(*blocks)
 
@@ -174,6 +216,8 @@ class PgClusterApp(App):
         self.refresh_seconds = max(1, int(refresh_seconds))
         self.once = once
         self.target = target
+        self.last_transactions = None
+        self.last_sample_at = None
 
     def compose(self) -> ComposeResult:
         yield Static(id="topology")
@@ -185,7 +229,15 @@ class PgClusterApp(App):
             for name in self.runtime.target_instances(target):
                 if name not in names:
                     names.append(name)
-        return _instance_states(self.config, self.runtime, names), targets
+        states = _instance_states(self.config, self.runtime, names)
+        operational = _operational_metrics(self.config, self.runtime, states)
+        details = {}
+        for target in targets:
+            try:
+                details[target] = _metrics(self.config, self.runtime, target)
+            except (KeyError, OperationError):
+                details[target] = {"replication": "未知"}
+        return states, targets, operational, details
 
     def on_mount(self):
         if self.once:
@@ -195,8 +247,8 @@ class PgClusterApp(App):
             self.set_interval(self.refresh_seconds, self.refresh_dashboard)
 
     def refresh_once(self):
-        states, targets = self._snapshot()
-        self.apply_snapshot(states, targets)
+        states, targets, operational, details = self._snapshot()
+        self.apply_snapshot(states, targets, operational, details)
         self.set_timer(0.15, self.exit)
 
     def action_quit(self):
@@ -207,12 +259,20 @@ class PgClusterApp(App):
 
     @work(thread=True, exclusive=True)
     def refresh_dashboard(self):
-        states, targets = self._snapshot()
-        self.call_from_thread(self.apply_snapshot, states, targets)
+        states, targets, operational, details = self._snapshot()
+        self.call_from_thread(self.apply_snapshot, states, targets, operational, details)
 
-    def apply_snapshot(self, states, targets):
+    def apply_snapshot(self, states, targets, operational, details):
+        now = time.monotonic()
+        transactions = operational.get("transactions", 0)
+        tps = 0.0
+        if self.last_transactions is not None and self.last_sample_at is not None:
+            tps = max(0, transactions - self.last_transactions) / max(1, now - self.last_sample_at)
+        self.last_transactions = transactions
+        self.last_sample_at = now
         self.query_one("#topology", Static).update(
-            Align.center(_deployment_map(self.config, self.runtime, states, targets), vertical="middle")
+            Align.center(_deployment_map(self.config, self.runtime, states, targets, operational, details, tps),
+                         vertical="middle")
         )
         if self.once:
             self.exit()
