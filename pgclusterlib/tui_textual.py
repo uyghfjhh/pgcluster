@@ -61,6 +61,11 @@ def _pid(state):
     return (match.group(1) or match.group(2)) if match else "-"
 
 
+def _short_data_dir(value):
+    parts = str(value).rstrip("/").split("/")
+    return "…/" + "/".join(parts[-3:]) if len(parts) > 3 else str(value)
+
+
 def _database_node(config, states, name):
     """Render exactly one PostgreSQL instance as one box."""
     state = states.get(name, {})
@@ -70,9 +75,11 @@ def _database_node(config, states, name):
     content = Text.from_markup(
         "[b bright_cyan]▣ %s[/]\n"
         "[%s]● %s[/]\n"
-        "[dim]%s:%s  pid=%s[/]" %
+        "[dim]%s:%s  pid=%s[/]\n"
+        "[dim]PGDATA %s[/]" %
         (_short_instance(name), _tone(status), status,
-         instance["host_config"]["address"], instance["port"], _pid(state))
+         instance["host_config"]["address"], instance["port"], _pid(state),
+         _short_data_dir(instance["data_dir"]))
     )
     return Panel(content, border_style=_tone(status), width=46, padding=(0, 1))
 
