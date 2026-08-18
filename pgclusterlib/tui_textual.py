@@ -1,5 +1,6 @@
 """Full-screen deployment map for pgcluster."""
 
+from rich.align import Align
 from rich.columns import Columns
 from rich.console import Group
 from rich.panel import Panel
@@ -75,8 +76,9 @@ def _relationship(label, symbol="════════▶"):
     return Text("\n%s\n%s" % (symbol, label), style="bold yellow", justify="center")
 
 
-def _lane(title, status, content):
-    return Panel(content, title=title, title_align="left", border_style=_tone(status), padding=(0, 1))
+def _lane(title, status, content, width):
+    return Panel(content, title=title, title_align="left", border_style=_tone(status),
+                 padding=(0, 1), width=width)
 
 
 def _deployment_map(config, runtime, states, targets):
@@ -88,7 +90,8 @@ def _deployment_map(config, runtime, states, targets):
     for stream in standalone_streams:
         status = _stream_status(runtime, states, stream)
         blocks.append(_lane("物理流复制  %s" % stream, status,
-                            Columns([_database_card(config, runtime, states, stream, "STREAMING DATABASE")], expand=False)))
+                            Columns([_database_card(config, runtime, states, stream, "STREAMING DATABASE")], expand=False),
+                            40))
 
     for name, link in config.logical_replications.items():
         if "logical.%s" % name not in target_set:
@@ -102,7 +105,7 @@ def _deployment_map(config, runtime, states, targets):
                                 _database_card(config, runtime, states, pub, "PUBLISHER DATABASE"),
                                 _relationship("LOGICAL REPLICATION"),
                                 _database_card(config, runtime, states, sub, "SUBSCRIBER DATABASE"),
-                            ], expand=False)))
+                            ], expand=False), 96))
 
     for name, cluster in config.citus_clusters.items():
         if "citus.%s" % name not in target_set:
@@ -116,7 +119,7 @@ def _deployment_map(config, runtime, states, targets):
         nodes = [_database_card(config, runtime, states, coordinator, "CITUS COORDINATOR")]
         nodes.append(_relationship("CITUS DISTRIBUTION"))
         nodes.extend(_database_card(config, runtime, states, stream, label) for label, stream in workers)
-        blocks.append(_lane("Citus  %s" % name, status, Columns(nodes, expand=False)))
+        blocks.append(_lane("Citus  %s" % name, status, Columns(nodes, expand=False), 132))
 
     for name, cluster in config.mmr_clusters.items():
         if "mmr.%s" % name not in target_set:
@@ -130,7 +133,7 @@ def _deployment_map(config, runtime, states, targets):
             if index:
                 nodes.append(_relationship("MMR MULTI-MASTER", "═══════↔"))
             nodes.append(_database_card(config, runtime, states, stream, label))
-        blocks.append(_lane("MMR  %s" % name, status, Columns(nodes, expand=False)))
+        blocks.append(_lane("MMR  %s" % name, status, Columns(nodes, expand=False), 96))
 
     return Group(*blocks)
 
@@ -138,7 +141,7 @@ def _deployment_map(config, runtime, states, targets):
 class PgClusterApp(App):
     CSS = """
     Screen { background: #10161c; color: #d8e2ea; }
-    #topology { height: 1fr; margin: 1 2; padding: 1; border: round #2b7189; overflow: hidden; }
+    #topology { height: 1fr; margin: 1 2; padding: 1; border: round #2b7189; overflow: hidden; content-align: center middle; }
     """
     BINDINGS = [("q", "quit", "退出"), ("r", "refresh_now", "刷新")]
 
@@ -187,7 +190,7 @@ class PgClusterApp(App):
 
     def apply_snapshot(self, states, targets):
         self.query_one("#topology", Static).update(
-            _deployment_map(self.config, self.runtime, states, targets)
+            Align.center(_deployment_map(self.config, self.runtime, states, targets), vertical="middle")
         )
         if self.once:
             self.exit()
