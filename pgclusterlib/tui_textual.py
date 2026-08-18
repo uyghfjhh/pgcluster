@@ -61,7 +61,7 @@ def _pid(state):
     return (match.group(1) or match.group(2)) if match else "-"
 
 
-def _database_node(config, states, name, label):
+def _database_node(config, states, name):
     """Render exactly one PostgreSQL instance as one box."""
     state = states.get(name, {})
     running = state.get("running")
@@ -70,9 +70,8 @@ def _database_node(config, states, name, label):
     content = Text.from_markup(
         "[b bright_cyan]▣ %s[/]\n"
         "[%s]● %s[/]\n"
-        "[cyan]%s[/]\n"
         "[dim]%s:%s  pid=%s[/]" %
-        (label, _tone(status), status, _short_instance(name),
+        (_short_instance(name), _tone(status), status,
          instance["host_config"]["address"], instance["port"], _pid(state))
     )
     return Panel(content, border_style=_tone(status), width=46, padding=(0, 1))
@@ -82,12 +81,12 @@ def _physical_arrow():
     return Text("\n  ────▶\n PHYSICAL", style="bold bright_cyan", justify="center")
 
 
-def _stream_pair(config, runtime, states, stream, label):
+def _stream_pair(config, runtime, states, stream):
     primary = runtime._primary(stream)
     standbys = runtime._streaming_standbys(stream)
-    nodes = [_database_node(config, states, primary, "%s PRIMARY" % label)]
+    nodes = [_database_node(config, states, primary)]
     for standby in standbys:
-        nodes.extend((_physical_arrow(), _database_node(config, states, standby, "%s STANDBY" % label)))
+        nodes.extend((_physical_arrow(), _database_node(config, states, standby)))
     return Columns(nodes, expand=False)
 
 
@@ -109,7 +108,7 @@ def _deployment_map(config, runtime, states, targets):
     for stream in standalone_streams:
         status = _stream_status(runtime, states, stream)
         blocks.append(_lane("物理流复制  %s" % stream, status,
-                            _stream_pair(config, runtime, states, stream, "STREAM"), 110))
+                            _stream_pair(config, runtime, states, stream), 110))
 
     for name, link in config.logical_replications.items():
         if "logical.%s" % name not in target_set:
@@ -119,9 +118,9 @@ def _deployment_map(config, runtime, states, targets):
         statuses = [_stream_status(runtime, states, pub), _stream_status(runtime, states, sub)]
         status = "运行中" if all(item == "运行中" for item in statuses) else "部分停止"
         blocks.append(_lane("逻辑复制  %s" % name, status,
-                            Group(_stream_pair(config, runtime, states, pub, "PUB"),
+                            Group(_stream_pair(config, runtime, states, pub),
                                   _logical_arrow(),
-                                  _stream_pair(config, runtime, states, sub, "SUB")), 110))
+                                  _stream_pair(config, runtime, states, sub)), 110))
 
     for name, cluster in config.citus_clusters.items():
         if "citus.%s" % name not in target_set:
@@ -132,9 +131,9 @@ def _deployment_map(config, runtime, states, targets):
         streams = [coordinator] + [stream for _label, stream in workers]
         statuses = [_stream_status(runtime, states, stream) for stream in streams]
         status = "运行中" if all(item == "运行中" for item in statuses) else "部分停止"
-        nodes = [_stream_pair(config, runtime, states, coordinator, "COORD")]
+        nodes = [_stream_pair(config, runtime, states, coordinator)]
         nodes.append(Text("     ╰═════════ CITUS DISTRIBUTION ═════════▶", style="bold yellow"))
-        nodes.extend(_stream_pair(config, runtime, states, stream, label) for label, stream in workers)
+        nodes.extend(_stream_pair(config, runtime, states, stream) for _label, stream in workers)
         blocks.append(_lane("Citus  %s" % name, status, Group(*nodes), 110))
 
     for name, cluster in config.mmr_clusters.items():
@@ -148,7 +147,7 @@ def _deployment_map(config, runtime, states, targets):
         for index, (label, stream) in enumerate(members):
             if index:
                 nodes.append(Text("     ╰═════════ MMR MULTI-MASTER ═════════↔", style="bold yellow"))
-            nodes.append(_stream_pair(config, runtime, states, stream, label))
+            nodes.append(_stream_pair(config, runtime, states, stream))
         blocks.append(_lane("MMR  %s" % name, status, Group(*nodes), 110))
 
     return Group(*blocks)
