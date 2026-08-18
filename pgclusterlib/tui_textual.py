@@ -61,37 +61,42 @@ def _pid(state):
     return (match.group(1) or match.group(2)) if match else "-"
 
 
-def _machine(config, states, name):
+def _database_node(config, states, name, label):
+    """Render exactly one PostgreSQL instance as one box."""
+    state = states.get(name, {})
+    running = state.get("running")
+    status = "运行中" if running is True else "已停止" if running is False else "未知"
     instance = config.instance(name)
-    return "%s@%s:%s pid=%s" % (
-        _short_instance(name), instance["host_config"]["address"], instance["port"], _pid(states.get(name))
-    )
-
-
-def _database_card(config, runtime, states, stream, label):
-    """A compact database-shaped node for a physical streaming pair."""
-    status = _stream_status(runtime, states, stream)
-    primary = runtime._primary(stream)
-    standbys = runtime._streaming_standbys(stream)
-    standby = standbys[0] if standbys else None
-    standby_label = _machine(config, states, standby) if standby else "-"
     content = Text.from_markup(
         "[b bright_cyan]▣ %s[/]\n"
         "[%s]● %s[/]\n"
-        "[b]P[/]  %s\n"
-        "[bright_cyan]└─▶[/] [b]S[/]  %s" %
-        (label, _tone(status), status, _machine(config, states, primary), standby_label)
+        "[cyan]%s[/]\n"
+        "[dim]%s:%s  pid=%s[/]" %
+        (label, _tone(status), status, _short_instance(name),
+         instance["host_config"]["address"], instance["port"], _pid(state))
     )
-    return Panel(content, title="%s" % stream, title_align="left",
-                 border_style=_tone(status), width=52, padding=(0, 1))
+    return Panel(content, border_style=_tone(status), width=46, padding=(0, 1))
 
 
-def _relationship(label, symbol="════════▶"):
-    return Text("\n%s\n%s" % (symbol, label), style="bold yellow", justify="center")
+def _physical_arrow():
+    return Text("\n  ────▶\n PHYSICAL", style="bold bright_cyan", justify="center")
+
+
+def _stream_pair(config, runtime, states, stream, label):
+    primary = runtime._primary(stream)
+    standbys = runtime._streaming_standbys(stream)
+    nodes = [_database_node(config, states, primary, "%s PRIMARY" % label)]
+    for standby in standbys:
+        nodes.extend((_physical_arrow(), _database_node(config, states, standby, "%s STANDBY" % label)))
+    return Columns(nodes, expand=False)
+
+
+def _logical_arrow():
+    return Text("  │\n  ▼  LOGICAL REPLICATION", style="bold yellow")
 
 
 def _lane(title, status, content, width):
-    return Panel(content, title=title, title_align="left", border_style=_tone(status),
+    return Panel(Align.center(content), title=title, title_align="left", border_style=_tone(status),
                  padding=(0, 1), width=width)
 
 
@@ -104,8 +109,7 @@ def _deployment_map(config, runtime, states, targets):
     for stream in standalone_streams:
         status = _stream_status(runtime, states, stream)
         blocks.append(_lane("物理流复制  %s" % stream, status,
-                            Columns([_database_card(config, runtime, states, stream, "STREAMING DATABASE")], expand=False),
-                            58))
+                            _stream_pair(config, runtime, states, stream, "STREAM"), 110))
 
     for name, link in config.logical_replications.items():
         if "logical.%s" % name not in target_set:
@@ -115,11 +119,9 @@ def _deployment_map(config, runtime, states, targets):
         statuses = [_stream_status(runtime, states, pub), _stream_status(runtime, states, sub)]
         status = "运行中" if all(item == "运行中" for item in statuses) else "部分停止"
         blocks.append(_lane("逻辑复制  %s" % name, status,
-                            Columns([
-                                _database_card(config, runtime, states, pub, "PUBLISHER DATABASE"),
-                                _relationship("LOGICAL REPLICATION"),
-                                _database_card(config, runtime, states, sub, "SUBSCRIBER DATABASE"),
-                            ], expand=False), 136))
+                            Group(_stream_pair(config, runtime, states, pub, "PUB"),
+                                  _logical_arrow(),
+                                  _stream_pair(config, runtime, states, sub, "SUB")), 110))
 
     for name, cluster in config.citus_clusters.items():
         if "citus.%s" % name not in target_set:
@@ -130,10 +132,10 @@ def _deployment_map(config, runtime, states, targets):
         streams = [coordinator] + [stream for _label, stream in workers]
         statuses = [_stream_status(runtime, states, stream) for stream in streams]
         status = "运行中" if all(item == "运行中" for item in statuses) else "部分停止"
-        nodes = [_database_card(config, runtime, states, coordinator, "CITUS COORDINATOR")]
-        nodes.append(_relationship("CITUS DISTRIBUTION"))
-        nodes.extend(_database_card(config, runtime, states, stream, label) for label, stream in workers)
-        blocks.append(_lane("Citus  %s" % name, status, Columns(nodes, expand=False), 178))
+        nodes = [_stream_pair(config, runtime, states, coordinator, "COORD")]
+        nodes.append(Text("     ╰═════════ CITUS DISTRIBUTION ═════════▶", style="bold yellow"))
+        nodes.extend(_stream_pair(config, runtime, states, stream, label) for label, stream in workers)
+        blocks.append(_lane("Citus  %s" % name, status, Group(*nodes), 110))
 
     for name, cluster in config.mmr_clusters.items():
         if "mmr.%s" % name not in target_set:
@@ -145,9 +147,9 @@ def _deployment_map(config, runtime, states, targets):
         nodes = []
         for index, (label, stream) in enumerate(members):
             if index:
-                nodes.append(_relationship("MMR MULTI-MASTER", "═══════↔"))
-            nodes.append(_database_card(config, runtime, states, stream, label))
-        blocks.append(_lane("MMR  %s" % name, status, Columns(nodes, expand=False), 136))
+                nodes.append(Text("     ╰═════════ MMR MULTI-MASTER ═════════↔", style="bold yellow"))
+            nodes.append(_stream_pair(config, runtime, states, stream, label))
+        blocks.append(_lane("MMR  %s" % name, status, Group(*nodes), 110))
 
     return Group(*blocks)
 
