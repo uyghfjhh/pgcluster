@@ -104,32 +104,68 @@ def _metrics(config, runtime, target):
     if kind == "streaming":
         primary = runtime._primary(name)
         row = _query(runtime, primary,
-                     "SELECT count(*)||'|'||COALESCE(max(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)),0) "
+                     "SELECT count(*)||'|'||pg_current_wal_lsn()::text||'|'||"
+                     "COALESCE(max(pg_wal_lsn_diff(pg_current_wal_lsn(), sent_lsn)),0)||'|'||"
+                     "COALESCE(max(pg_wal_lsn_diff(pg_current_wal_lsn(), write_lsn)),0)||'|'||"
+                     "COALESCE(max(pg_wal_lsn_diff(pg_current_wal_lsn(), flush_lsn)),0)||'|'||"
+                     "COALESCE(max(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)),0)||'|'||"
+                     "COALESCE(max(EXTRACT(EPOCH FROM replay_lag)),0) "
                      "FROM pg_stat_replication WHERE state='streaming'")
-        if "|" in row:
-            connected, lag = row.split("|", 1)
+        fields = row.split("|") if "|" in row else []
+        if len(fields) == 7:
+            connected, current_lsn, sent_lag, write_lag, flush_lag, replay_lag, replay_seconds = fields
         else:
-            connected, lag = "未知", "未知"
+            connected, current_lsn, sent_lag, write_lag, flush_lag, replay_lag, replay_seconds = ("未知",) * 7
         expected = len(config.streaming_clusters[name].get("standbys") or [])
         return {"replication": "%s/%s streaming" % (connected, expected),
-                "standbys": connected, "expected": expected, "lag_bytes": lag}
+                "standbys": connected, "expected": expected, "primary_current_lsn": current_lsn,
+                "sent_lag_bytes": sent_lag, "write_lag_bytes": write_lag,
+                "flush_lag_bytes": flush_lag, "replay_lag_bytes": replay_lag,
+                "replay_lag_seconds": replay_seconds}
     if kind == "logical":
         link = config.logical_replications[name]
+        pub = runtime._primary(link["pub"]["streaming_cluster"])
         sub = runtime._primary(link["sub"]["streaming_cluster"])
         database = link["sub"].get("database", link["pub"].get("database", "postgres"))
+        slot = (link["sub"].get("slot") or {}).get("name") or "%s_slot" % name
+        publisher_row = _query(runtime, pub,
+                               "SELECT pg_current_wal_lsn()::text||'|'||"
+                               "COALESCE((SELECT restart_lsn::text FROM pg_replication_slots WHERE slot_name=%s),'')||'|'||"
+                               "COALESCE((SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name=%s),'')||'|'||"
+                               "COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(),(SELECT restart_lsn FROM pg_replication_slots WHERE slot_name=%s))::text,'')||'|'||"
+                               "COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(),(SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name=%s))::text,'')" %
+                               (quote_literal(slot), quote_literal(slot), quote_literal(slot), quote_literal(slot)), database)
+        publisher_fields = publisher_row.split("|", 4) if "|" in publisher_row else []
+        if len(publisher_fields) == 5:
+            publisher_lsn, restart_lsn, confirmed_lsn, retained_bytes, confirmed_lag_bytes = publisher_fields
+        else:
+            publisher_lsn, restart_lsn, confirmed_lsn, retained_bytes, confirmed_lag_bytes = ("未知",) * 5
         row = _query(runtime, sub,
-                     "SELECT subenabled::text||'|'||COALESCE(latest_end_lsn::text,'') "
+                     "SELECT subenabled::text||'|'||COALESCE(received_lsn::text,'')||'|'||"
+                     "COALESCE(latest_end_lsn::text,'')||'|'||"
+                     "COALESCE(EXTRACT(EPOCH FROM now()-latest_end_time)::text,'') "
                      "FROM pg_subscription s LEFT JOIN pg_stat_subscription g USING (subname) "
                      "WHERE s.subname=%s" % quote_literal("%s_sub" % name), database)
-        if "|" in row:
-            enabled, lsn = row.split("|", 1)
+        fields = row.split("|", 3) if "|" in row else []
+        if len(fields) == 4:
+            enabled, received_lsn, latest_lsn, apply_seconds = fields
             subscription = "enabled" if enabled == "t" else "disabled"
         elif row == "未知":
-            subscription, lsn = "未知", "未知"
+            subscription, received_lsn, latest_lsn, apply_seconds = "未知", "未知", "未知", "未知"
         else:
-            subscription, lsn = "missing", "-"
+            subscription, received_lsn, latest_lsn, apply_seconds = "missing", "-", "-", "-"
+        lsn_lag = "未知"
+        if publisher_lsn not in {"未知", ""} and latest_lsn not in {"未知", "", "-"}:
+            lsn_lag = _query(runtime, sub,
+                             "SELECT COALESCE(pg_wal_lsn_diff(%s,%s),0)" %
+                             (quote_literal(publisher_lsn), quote_literal(latest_lsn)), database)
         return {"replication": "subscription=%s" % subscription, "subscription": subscription,
-                "latest_lsn": lsn or "-"}
+                "publisher_current_lsn": publisher_lsn, "slot_restart_lsn": restart_lsn or "-",
+                "slot_confirmed_flush_lsn": confirmed_lsn or "-", "slot_retained_bytes": retained_bytes or "-",
+                "slot_confirmed_lag_bytes": confirmed_lag_bytes or "-",
+                "subscriber_received_lsn": received_lsn or "-",
+                "subscriber_latest_lsn": latest_lsn or "-", "logical_lsn_lag_bytes": lsn_lag,
+                "apply_lag_seconds": apply_seconds or "-"}
     if kind == "citus":
         cluster = config.citus_clusters[name]
         coordinator = runtime._primary(cluster["coordinator"]["streaming_cluster"])

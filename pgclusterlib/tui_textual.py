@@ -132,11 +132,21 @@ def _metric_line(operational, detail, target, tps):
         "%s%%" % cache_hit if cache_hit is not None else "未知")
     kind = target.split(".", 1)[0]
     if kind == "streaming":
-        extra = "流复制=%s | WAL延迟=%s" % (detail.get("replication", "未知"), format_bytes(detail.get("lag_bytes")))
+        extra = ("流复制指标 %s | WAL lag(发送/写入/刷盘/回放)=%s/%s/%s/%s | 回放时间=%ss" %
+                 (detail.get("replication", "未知"),
+                  format_bytes(detail.get("sent_lag_bytes")), format_bytes(detail.get("write_lag_bytes")),
+                  format_bytes(detail.get("flush_lag_bytes")), format_bytes(detail.get("replay_lag_bytes")),
+                  detail.get("replay_lag_seconds", "未知")))
     elif kind == "logical":
         subscription = {"enabled": "启用", "disabled": "停用", "missing": "缺失"}.get(
             detail.get("subscription"), "未知")
-        extra = "订阅=%s | 最新LSN=%s" % (subscription, detail.get("latest_lsn", "-"))
+        extra = ("逻辑复制 订阅=%s | publisher_current=%s | subscriber_received=%s | subscriber_latest=%s\n"
+                 "slot restart_lsn=%s | confirmed_flush_lsn=%s | retained=%s | confirmed_lag=%s | apply=%ss" %
+                 (subscription, detail.get("publisher_current_lsn", "-"),
+                  detail.get("subscriber_received_lsn", "-"), detail.get("subscriber_latest_lsn", "-"),
+                  detail.get("slot_restart_lsn", "-"), detail.get("slot_confirmed_flush_lsn", "-"),
+                  format_bytes(detail.get("slot_retained_bytes")), format_bytes(detail.get("slot_confirmed_lag_bytes")),
+                  detail.get("apply_lag_seconds", "-")))
     else:
         extra = detail.get("replication", "未知").replace("workers=", "Worker=").replace("active=", "活跃成员=")
     return "METRIC  %s | %s" % (common, extra)

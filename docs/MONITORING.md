@@ -229,7 +229,29 @@ WAL 延迟（字节） = 主库当前 WAL LSN - 备库 replay_lsn
 Publisher Primary ── LOGICAL REPLICATION ──▶ Subscriber Primary
 ```
 
-### 4.1 订阅状态
+### 4.1 逻辑复制中几种 LSN 的区别
+
+逻辑复制不是只有一个“latest LSN”。行业监控通常至少区分以下位置：
+
+| 名称 | 所在端 | 含义 |
+| --- | --- | --- |
+| `publisher_current_lsn` | Publisher | 发布端当前 WAL 写入位置，用来作为比较基准 |
+| `restart_lsn` | Publisher replication slot | 该 slot 仍需要保留的最早 WAL 位置，决定 WAL 保留压力 |
+| `confirmed_flush_lsn` | Publisher replication slot | Subscriber 已确认处理到的 WAL 位置 |
+| `received_lsn` | Subscriber | Subscriber 已从 Publisher 接收的最新位置 |
+| `latest_end_lsn` | Subscriber | Subscriber 逻辑 apply worker 最近完成处理的位置 |
+
+它们之间的关系可以简化为：
+
+```text
+Publisher WAL:  restart_lsn ───── confirmed_flush_lsn ───────── publisher_current_lsn
+                                      │
+                                      └── Subscriber: received_lsn ── latest_end_lsn
+```
+
+因此 TUI 不再显示没有上下文的 `latest_lsn`，而是显示带来源的名称。
+
+### 4.2 订阅状态
 
 数据来源：
 
@@ -244,15 +266,34 @@ WHERE s.subname = '<name>_sub';
 
 `订阅=启用` 表示 `subenabled=true`；`订阅=停用` 表示订阅存在但被禁用；`订阅=缺失` 表示找不到对应订阅对象。
 
-### 4.2 最新 LSN
+### 4.3 replication slot 与 LSN 差值
 
-`最新LSN` 是 `pg_stat_subscription.latest_end_lsn`，表示订阅端最近完成处理的远端 WAL 位置，例如：
+Publisher 上的 slot 信息来自：
 
-```text
-最新LSN=0/3057720
+```sql
+SELECT restart_lsn, confirmed_flush_lsn
+FROM pg_replication_slots
+WHERE slot_name = '<configured slot name>';
 ```
 
-LSN 本身不是字节延迟。要得到严格的逻辑复制延迟，需要将 Publisher 当前 WAL LSN 与 Subscriber 的最新 LSN 做差；当前 TUI 先展示状态和位置，避免在不同数据库/连接异常时给出误导性的延迟值。
+TUI 还计算两个字节差：
+
+```text
+slot retained = publisher_current_lsn - restart_lsn
+confirmed lag = publisher_current_lsn - confirmed_flush_lsn
+```
+
+`slot retained` 反映该逻辑 slot 可能要求 Publisher 保留多少 WAL；持续增大时需要关注 `pg_wal` 磁盘空间。它不是 Subscriber 当前 apply 延迟。
+
+### 4.4 Subscriber LSN 与 apply 延迟
+
+`subscriber_latest` 是 `pg_stat_subscription.latest_end_lsn`，表示订阅端最近完成处理的远端 WAL 位置，例如：
+
+```text
+subscriber_latest=0/3057720
+```
+
+TUI 用 `pg_wal_lsn_diff(publisher_current_lsn, subscriber_latest_lsn)` 计算 `LSN lag`，并显示 `latest_end_time` 推导的 apply 秒数。LSN 本身不是时间延迟；如果 Publisher 和 Subscriber 不可比较或订阅尚未收到 WAL，相关值显示为 `未知`。
 
 ## 5. Citus 和 MMR 指标
 
@@ -338,4 +379,3 @@ TUI 不会把无法采集的数据伪装成 0。`0` 表示查询确实返回了 
 # 复制当前拓扑纯文本
 # 启动 TUI 后按 c
 ```
-
