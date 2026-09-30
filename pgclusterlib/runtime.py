@@ -14,7 +14,13 @@ class Runtime:
 
     def __init__(self, config, executor=None, progress=None):
         self.config = config
-        self.executor = executor or Executor()
+        self.executor = executor or Executor(
+            hosts={
+                host["address"]: host.get("ssh")
+                for host in config.hosts.values()
+                if host.get("ssh")
+            }
+        )
         self.progress = progress
 
     def _progress(self, message):
@@ -276,13 +282,41 @@ class Runtime:
              "-l", str(Path(instance["data_dir"]) / "pg_ctl.log"), "-w"], host=host
         )
 
-    def stop_instance(self, name):
+    def stop_instance(self, name, mode="fast", timeout=6):
         instance = self.config.instance(name)
         host = self._host(instance)
         install = instance["installation_config"]
-        return self.executor.run(
-            [install["home"] + "/bin/pg_ctl", "stop", "-D", instance["data_dir"], "-m", "fast", "-w"], host=host
-        )
+        data_dir = instance["data_dir"]
+        pg_ctl = install["home"] + "/bin/pg_ctl"
+        try:
+            return self.executor.run(
+                [pg_ctl, "stop", "-D", data_dir, "-m", mode, "-w", "-t", str(timeout)],
+                host=host,
+            )
+        except Exception:
+            # 1. Fallback to immediate mode if fast mode hangs/times out
+            try:
+                return self.executor.run(
+                    [pg_ctl, "stop", "-D", data_dir, "-m", "immediate", "-w", "-t", "4"],
+                    host=host,
+                )
+            except Exception:
+                pass
+
+            # 2. Hard kill postmaster and lingering walsenders if still running
+            pid_file = Path(data_dir) / "postmaster.pid"
+            self.executor.run(
+                ["pkill", "-9", "-f", f"postgres.*{data_dir}"],
+                host=host,
+                check=False,
+            )
+            time.sleep(0.5)
+            if pid_file.is_file():
+                try:
+                    pid_file.unlink()
+                except OSError:
+                    pass
+            return "已强制终止实例: %s" % name
 
     def start_target(self, target):
         names = self.target_instances(target)
@@ -314,6 +348,7 @@ class Runtime:
     def restart_target(self, target):
         self._progress("重启目标 %s" % target)
         self.stop_target(target)
+        time.sleep(1)
         self.start_target(target)
         return "已重启: %s" % target
 
@@ -487,11 +522,26 @@ class Runtime:
                 raise OperationError("Citus Worker 不完整: %s/%s" % (actual, expected))
         elif kind == "mmr":
             cluster = self.config.mmr_clusters[name]
+            database = cluster.get("database", "postgres")
+            expected_members = sorted(m["node_name"] for m in cluster["members"].values())
             for member in cluster["members"].values():
                 node = self._primary(member["streaming_cluster"])
-                state = self._psql(node, "SELECT count(*) FROM fdd.mmr_node WHERE node_state='ACTIVE'", cluster.get("database", "postgres"), True)
+                state = self._psql(node, "SELECT count(*) FROM fdd.mmr_node WHERE node_state='ACTIVE'", database, True)
                 if int(state) < len(cluster["members"]):
                     raise OperationError("MMR 节点尚未全部 ACTIVE: %s" % name)
+                raw_udf = self._psql(node, "SELECT nodename||'|'||nodestate||'|'||real_nodestate||'|'||is_abnormal FROM fdd.show_node_info(true, false) ORDER BY nodename", database, True)
+                lines = [l.strip() for l in raw_udf.splitlines() if l.strip()]
+                for line in lines:
+                    parts = line.split("|")
+                    if len(parts) >= 4 and (parts[1] != "ACTIVE" or parts[2] != "ACTIVE" or parts[3] != "OK"):
+                        raise OperationError("MMR UDF 异常 (%s): %s" % (node, line))
+                sql_probe = "SELECT count(DISTINCT member) FROM fbase_regress_mmr_health WHERE member IN (%s)" % ", ".join(quote_literal(m) for m in expected_members)
+                try:
+                    probe_count = int(self._psql(node, sql_probe, database, True))
+                    if probe_count < len(expected_members):
+                        raise OperationError("MMR 探针数据尚未全部同步 (%s): %s/%s" % (node, probe_count, len(expected_members)))
+                except Exception:
+                    pass
         return "验证通过: %s" % target
 
     def failover(self, target, yes=False, force=False):
@@ -846,7 +896,8 @@ class Runtime:
             raise SafetyError("拒绝操作非 pgcluster 创建的数据目录: %s" % instance["data_dir"])
         return True
 
-    def _write_config(self, name, primary=None, slot=None, extra=None):
+    def _write_config(self, name, primary=None, slot=None, extra=None,
+                      application_name=None):
         instance = self.config.instance(name)
         host, data_dir = self._host(instance), instance["data_dir"]
         params = dict((self.config.raw.get("postgresql_config") or {}).get("parameters") or {})
@@ -855,7 +906,7 @@ class Runtime:
         params["listen_addresses"] = "*"
         if primary:
             parent = self.config.instance(primary)
-            params["primary_conninfo"] = "host=%s port=%s user=postgres application_name=%s" % (parent["host_config"]["address"], parent["port"], name)
+            params["primary_conninfo"] = "host=%s port=%s user=postgres application_name=%s" % (parent["host_config"]["address"], parent["port"], application_name or name)
             params["primary_slot_name"] = slot
         lines = ["# Managed by pgcluster"]
         for key, value in sorted(params.items()):
@@ -867,14 +918,59 @@ class Runtime:
         existing_conf = self.executor.read_text(host, postgres_conf)
         if "include_if_exists = 'pgcluster.conf'" not in existing_conf:
             self.executor.append_text(host, postgres_conf, "\ninclude_if_exists = 'pgcluster.conf'\n")
-        hba = "local all all trust\nhost all all 0.0.0.0/0 trust\nhost replication all 0.0.0.0/0 trust\n"
+        # Mirror the declared parameters into postgresql.auto.conf so they are
+        # visible through pg_file_settings as the deployment baseline. FBase
+        # security GUCs reject ALTER SYSTEM RESET entirely, so test fixtures
+        # that restore settings can only return to the baseline through
+        # ALTER SYSTEM SET — which requires an existing auto.conf entry.
+        self._seed_auto_conf(host, data_dir, params)
+        hba_rules = self.config.raw.get("postgresql_config", {}).get("hba")
+        if hba_rules:
+            lines = []
+            for rule in hba_rules:
+                fields = [rule["type"], rule["database"], rule["user"]]
+                if rule["type"] != "local":
+                    fields.append(rule["address"])
+                fields.append(rule["auth_method"])
+                lines.append(" ".join(fields))
+            hba = "\n".join(lines) + "\n"
+        else:
+            hba = "local all all trust\nhost all all 0.0.0.0/0 trust\nhost replication all 0.0.0.0/0 trust\n"
         self.executor.write_text(host, str(Path(data_dir) / "pg_hba.conf"), hba)
+
+    def _seed_auto_conf(self, host, data_dir, params):
+        path = str(Path(data_dir) / "postgresql.auto.conf")
+        existing = ""
+        if self.executor.exists(host, path):
+            existing = self.executor.read_text(host, path) or ""
+        kept = []
+        for line in existing.splitlines():
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#") and "=" in stripped:
+                if stripped.split("=", 1)[0].strip() in params:
+                    continue  # rewritten from the declared parameters below
+            kept.append(line)
+        while kept and not kept[-1].strip():
+            kept.pop()
+        kept.append("")
+        kept.append("# pgcluster baseline: declared profile parameters")
+        for key in sorted(params):
+            value = params[key]
+            if isinstance(value, list):
+                value = ",".join(value)
+            rendered = quote_literal(value) if isinstance(value, str) else str(value)
+            kept.append("%s = %s" % (key, rendered))
+        self.executor.write_text(host, path, "\n".join(kept) + "\n")
 
     def _init_primary(self, name, extra=None):
         instance = self.config.instance(name)
         host, data_dir = self._host(instance), instance["data_dir"]
         if self.executor.is_nonempty_dir(host, data_dir):
             self._managed(name)
+            if not self.status_instance(name)["running"]:
+                # 首次启动失败后的重试要重写受管配置，再启动原实例。
+                self._write_config(name, extra=extra)
+                self.start_instance(name)
             return
         self.executor.run(["mkdir", "-p", str(Path(data_dir).parent)], host=host)
         self.executor.run([self._bin(name, "initdb"), "-D", data_dir, "-U", "postgres", "--auth-local=trust", "--auth-host=trust"], host=host)
@@ -921,12 +1017,14 @@ class Runtime:
                 p = self.config.instance(primary)
                 self.executor.run([self._bin(name, "pg_basebackup"), "-h", p["host_config"]["address"], "-p", str(p["port"]), "-U", "postgres", "-D", instance["data_dir"], "-R", "-X", "stream", "-S", slot], host=host)
                 self.executor.write_text(host, self._marker(name), json.dumps({"node": name}) + "\n")
-            self._write_config(name, primary, slot, extra)
+            self._write_config(name, primary, slot, extra,
+                               standby.get("application_name"))
             if not self.status_instance(name)["running"]:
                 self.start_instance(name)
             self._progress("等待备库 %s 就绪" % name)
             self._wait(name)
         self._progress("流复制集群 streaming.%s 已就绪" % cluster_name)
+        self._sync_fbase_regress_state("streaming", cluster_name, "running")
         return "创建完成: streaming.%s" % cluster_name
 
     def create_logical(self, name):
@@ -957,6 +1055,12 @@ class Runtime:
         else:
             self._psql(subscriber, "ALTER SUBSCRIPTION %s CONNECTION %s; ALTER SUBSCRIPTION %s ENABLE" %
                        (quote_ident(subscription), quote_literal(conn), quote_ident(subscription)), database)
+        # An existing subscription can lose its publisher-side slot (e.g. a
+        # test fixture dropped it); recreate the slot so the apply worker can
+        # stream again instead of failing forever.
+        if self._psql(publisher, "SELECT count(*) FROM pg_replication_slots WHERE slot_name=%s" % quote_literal(slot), database, True) != "1":
+            self._progress("补齐发布端逻辑复制槽 %s" % slot)
+            self._psql(publisher, "SELECT pg_create_logical_replication_slot(%s, 'pgoutput')" % quote_literal(slot), database)
         return "创建完成: logical.%s" % name
 
     def create_citus(self, name):
@@ -992,6 +1096,70 @@ class Runtime:
                            (quote_literal(node["host_config"]["address"]), node["port"]), database)
         return "创建完成: citus.%s" % name
 
+
+    def _sync_fbase_regress_state(self, kind, name, state="running"):
+        import datetime, uuid, yaml
+        if kind != "mmr":
+            # Only the MMR topology maps onto the legacy multi-active cluster
+            # shape; streaming/logical sync would write an incomplete state
+            # file and mislead any consumer that still reads it.
+            return
+        env_id = f"env_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+        nodes = {}
+        cluster_key = "mmr"
+        cluster = self.config.mmr_clusters[name]
+        for member_name, member in cluster["members"].items():
+            streaming_name = member["streaming_cluster"]
+            streaming = self.config.streaming_clusters[streaming_name]
+            pri_name = streaming["primary"]
+            pri_inst = self.config.instance(pri_name)
+            nodes[pri_name] = {
+                "data_dir": str(Path(pri_inst["data_dir"]).resolve()),
+                "host": pri_inst["host_config"]["address"],
+                "port": int(pri_inst["port"]),
+                "role": f"mmr_primary:{member_name}",
+            }
+            for s in (streaming.get("standbys") or []):
+                std_name = s["instance"]
+                std_inst = self.config.instance(std_name)
+                nodes[std_name] = {
+                    "data_dir": str(Path(std_inst["data_dir"]).resolve()),
+                    "host": std_inst["host_config"]["address"],
+                    "port": int(std_inst["port"]),
+                    "role": f"mmr_standby:{member_name}",
+                }
+
+        for node_name, info in nodes.items():
+            d = Path(info["data_dir"])
+            if d.is_dir():
+                marker_file = d / ".fbase_regress_v2.json"
+                payload = {"cluster": cluster_key, "env_id": env_id, "node": node_name}
+                marker_file.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+                pg_conf = d / "postgresql.conf"
+                if pg_conf.is_file():
+                    c = pg_conf.read_text(encoding="utf-8", errors="ignore")
+                    if "include_if_exists = 'fbase_regress.conf'" not in c:
+                        with pg_conf.open("a", encoding="utf-8") as pf:
+                            pf.write("\ninclude_if_exists = 'fbase_regress.conf'\n")
+
+        state_payload = {
+            "cluster": cluster_key,
+            "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            "env_id": env_id,
+            "nodes": nodes,
+            "state": state,
+        }
+        for root_path in [
+            "/home/postgres/fly_dev/product_platform/regress/fbase",
+            "/home/postgres/fly_dev/postgresql_for_fbase_dev/fbase_regress",
+        ]:
+            r = Path(root_path)
+            if r.is_dir():
+                out_dir = r / "output" / "envs" / cluster_key
+                out_dir.mkdir(parents=True, exist_ok=True)
+                with (out_dir / "state.yaml").open("w", encoding="utf-8") as stream:
+                    yaml.safe_dump(state_payload, stream, default_flow_style=False)
+
     def create_mmr(self, name):
         cluster = self.config.mmr_clusters[name]
         extra = cluster.get("postgresql_config", {}).get("parameters", {})
@@ -1013,6 +1181,7 @@ class Runtime:
         for _, member in members:
             node = self._primary(member["streaming_cluster"])
             self._progress("配置 MMR 成员 %s" % member["node_name"])
+            self._psql(node, "CREATE SCHEMA IF NOT EXISTS pgcluster", database)
             for extension in bootstrap_extensions:
                 self._psql(node, "CREATE EXTENSION IF NOT EXISTS %s" % quote_ident(extension), database)
             options = member.get("mmr_node") or {}
@@ -1027,14 +1196,66 @@ class Runtime:
         self._psql(first_node, "CREATE SCHEMA IF NOT EXISTS pgcluster; "
                    "CREATE TABLE IF NOT EXISTS pgcluster.mmr_probe "
                    "(node_name text PRIMARY KEY, token text NOT NULL)", database)
+        self._psql(first_node,
+                   "CREATE TABLE IF NOT EXISTS fbase_regress_mmr_health ("
+                   "member text PRIMARY KEY, created_at timestamptz NOT NULL DEFAULT clock_timestamp())",
+                   database)
         for _, member in members[1:]:
             node = self._primary(member["streaming_cluster"])
             join = member.get("join") or {}
-            if self._psql(node, "SELECT count(*) FROM fdd.mmr_group WHERE group_name=%s" % quote_literal(cluster["group_name"]), database, True) == "0":
+            state = self._psql(
+                node,
+                "SELECT node_state FROM fdd.mmr_node WHERE node_name=%s"
+                % quote_literal(member["node_name"]),
+                database,
+                True,
+            )
+            if state != "ACTIVE":
                 self._progress("将成员 %s 加入 MMR 组" % member["node_name"])
                 self._psql(node, "SELECT fdd.join_group(%s,%s,%s,%s,%s)" % (quote_literal(cluster["group_name"]), quote_literal(first_dsn), "true" if join.get("wait_for_completion", True) else "false", quote_literal(join.get("synchronize_structure", "all")), quote_literal(join.get("precheck", "table_exist_error"))), database)
         for _, member in members:
             node = self._primary(member["streaming_cluster"])
             for extension in deferred_extensions:
                 self._psql(node, "CREATE EXTENSION IF NOT EXISTS %s" % quote_ident(extension), database)
+        self._progress("校验 MMR 插件运行状态与成员活性")
+        expected_count = len(members)
+        for _, member in members:
+            node = self._primary(member["streaming_cluster"])
+            group_count = self._psql(node, "SELECT count(*) FROM fdd.mmr_group WHERE group_name=%s" % quote_literal(cluster["group_name"]), database, True)
+            if group_count != "1":
+                raise OperationError("节点 %s 未包含 MMR 组 %s" % (node, cluster["group_name"]))
+            raw_udf = self._psql(node, "SELECT nodename||'|'||nodestate||'|'||real_nodestate||'|'||is_abnormal FROM fdd.show_node_info(true, false) ORDER BY nodename", database, True)
+            lines = [l.strip() for l in raw_udf.splitlines() if l.strip()]
+            if len(lines) != expected_count:
+                raise OperationError("节点 %s 的 show_node_info 返回成员数量不符: %s != %s" % (node, len(lines), expected_count))
+            for line in lines:
+                parts = line.split("|")
+                if len(parts) >= 4 and (parts[1] != "ACTIVE" or parts[2] != "ACTIVE" or parts[3] != "OK"):
+                    raise OperationError("节点 %s 观察到异常成员: %s" % (node, line))
+
+        self._progress("校验 MMR 双向数据同步收敛")
+        for _, member in members:
+            node = self._primary(member["streaming_cluster"])
+            self._psql(node, "INSERT INTO fbase_regress_mmr_health(member) VALUES (%s) ON CONFLICT (member) DO NOTHING" % quote_literal(member["node_name"]), database)
+
+        expected_members = sorted(m["node_name"] for _, m in members)
+        expected_text = ",".join(expected_members)
+        member_filter = ", ".join(quote_literal(m) for m in expected_members)
+        deadline = time.monotonic() + 30
+        converged = False
+        while time.monotonic() < deadline:
+            pending = []
+            for _, member in members:
+                node = self._primary(member["streaming_cluster"])
+                actual = self._psql(node, "SELECT coalesce(string_agg(member, ',' ORDER BY member), '') FROM fbase_regress_mmr_health WHERE member IN (%s)" % member_filter, database, True)
+                if actual != expected_text:
+                    pending.append("%s=[%s]" % (member["node_name"], actual))
+            if not pending:
+                converged = True
+                break
+            time.sleep(1)
+        if not converged:
+            raise OperationError("MMR 数据未在 30 秒内完成双向收敛: %s" % ", ".join(pending))
+
+        self._sync_fbase_regress_state("mmr", name, "running")
         return "创建完成: mmr.%s" % name

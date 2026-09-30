@@ -42,12 +42,27 @@ class OperationLog:
 class Executor:
     """Run commands and filesystem operations on local or SSH hosts."""
 
-    def __init__(self, operation_log=None):
+    def __init__(self, operation_log=None, hosts=None):
         self.log = operation_log
+        # address -> ssh options declared by hosts.<name>.ssh in pgcluster.yaml
+        self.hosts = dict(hosts or {})
 
     @staticmethod
     def is_local(address):
         return address in LOCAL_HOSTS
+
+    def _ssh_argv(self, host, args):
+        options = self.hosts.get(host) or {}
+        target = "%s@%s" % (options["user"], host) if options.get("user") else host
+        argv = [
+            "ssh", "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=%d" % int(options.get("connect_timeout", 10)),
+        ]
+        if options.get("identity_file"):
+            argv += ["-i", options["identity_file"]]
+        if options.get("port"):
+            argv += ["-p", str(int(options["port"]))]
+        return argv + [target, "--", shell_join(args)]
 
     def run(self, args, host="local", cwd=None, check=True, stdin=None):
         args = [str(item) for item in args]
@@ -55,7 +70,7 @@ class Executor:
         remote = host != "local" and not self.is_local(host)
         if remote:
             display = "ssh %s -- %s" % (shlex.quote(host), display)
-            actual = ["ssh", host, "--", shell_join(args)]
+            actual = self._ssh_argv(host, args)
             actual_cwd = None
         else:
             actual = args

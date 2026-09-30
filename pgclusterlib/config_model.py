@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 from .config import _expand
@@ -40,13 +41,38 @@ class ConfigModel:
     def _validate_hosts(self):
         if not self.hosts:
             raise ConfigError("hosts 不能为空")
+        addresses = set()
         for name, host in self.hosts.items():
             if not isinstance(host, dict) or not isinstance(host.get("address"), str):
                 raise ConfigError("hosts.%s.address 必须是非空地址" % name)
             if not host["address"]:
                 raise ConfigError("hosts.%s.address 必须是非空地址" % name)
+            if host["address"] in addresses:
+                raise ConfigError("hosts.%s.address 与其他主机重复" % name)
+            addresses.add(host["address"])
             if "transport" in host:
                 raise ConfigError("hosts.%s 不需要配置 transport，连接方式由地址推断" % name)
+            ssh = host.get("ssh")
+            if ssh is not None:
+                if not isinstance(ssh, dict):
+                    raise ConfigError("hosts.%s.ssh 必须是对象" % name)
+                unknown = set(ssh) - {"user", "port", "identity_file", "connect_timeout"}
+                if unknown:
+                    raise ConfigError("hosts.%s.ssh 含未知字段: %s" % (name, ", ".join(sorted(unknown))))
+                if ssh.get("user") is not None:
+                    if not isinstance(ssh["user"], str) or not re.fullmatch(
+                        r"[a-zA-Z_][a-zA-Z0-9_.-]*", ssh["user"]
+                    ):
+                        raise ConfigError("hosts.%s.ssh.user 必须是合法登录名" % name)
+                if ssh.get("port") is not None:
+                    if not isinstance(ssh["port"], int) or not 1 <= ssh["port"] <= 65535:
+                        raise ConfigError("hosts.%s.ssh.port 必须是 1-65535 的整数" % name)
+                if ssh.get("identity_file") is not None:
+                    if not isinstance(ssh["identity_file"], str) or not Path(ssh["identity_file"]).is_absolute():
+                        raise ConfigError("hosts.%s.ssh.identity_file 必须是绝对路径" % name)
+                if ssh.get("connect_timeout") is not None:
+                    if not isinstance(ssh["connect_timeout"], int) or ssh["connect_timeout"] < 1:
+                        raise ConfigError("hosts.%s.ssh.connect_timeout 必须是正整数秒" % name)
 
     def _validate_installations(self):
         if not self.installations:
@@ -148,6 +174,9 @@ class ConfigModel:
                 members.append(instance)
                 slot = standby.get("slot") or "%s_%s_slot" % (name, instance)
                 self._identifier(slot, "streaming_clusters.%s standby slot" % name)
+                if standby.get("application_name") is not None:
+                    self._identifier(standby["application_name"],
+                                     "streaming_clusters.%s standby application_name" % name)
             mode = (cluster.get("replication") or {}).get("mode", "async")
             if mode not in {"async", "sync"}:
                 raise ConfigError("streaming_clusters.%s.replication.mode 无效" % name)
@@ -204,8 +233,8 @@ class ConfigModel:
             if not isinstance(cluster, dict):
                 raise ConfigError("mmr_clusters.%s 必须是对象" % name)
             extensions = cluster.get("extensions")
-            if not isinstance(extensions, list) or not {"fbase_mac", "fdd_mmr", "fb_license"}.issubset(extensions):
-                raise ConfigError("mmr_clusters.%s.extensions 必须包含 FBase 多活和许可证扩展" % name)
+            if not isinstance(extensions, list) or "fdd_mmr" not in extensions:
+                raise ConfigError("mmr_clusters.%s.extensions 必须包含 fdd_mmr" % name)
             members = cluster.get("members")
             if not isinstance(members, dict) or not members:
                 raise ConfigError("mmr_clusters.%s.members 必须是非空对象" % name)
@@ -228,13 +257,28 @@ class ConfigModel:
                         raise ConfigError("%s.members.%s.join.precheck 无效" % (name, member_name))
 
     def _validate_global_config(self):
-        capacity = self.raw.get("postgresql_config", {}).get("replication_capacity", {})
+        postgres_config = self.raw.get("postgresql_config", {})
+        capacity = postgres_config.get("replication_capacity", {})
         if not isinstance(capacity, dict):
             raise ConfigError("postgresql_config.replication_capacity 必须是对象")
         for field in ("wal_senders", "replication_slots"):
             value = capacity.get(field, "auto")
             if value != "auto" and (not isinstance(value, int) or value < 1):
                 raise ConfigError("postgresql_config.replication_capacity.%s 必须是 auto 或正整数" % field)
+        hba = postgres_config.get("hba")
+        if hba is not None:
+            if not isinstance(hba, list) or not hba:
+                raise ConfigError("postgresql_config.hba 必须是非空列表")
+            for index, rule in enumerate(hba):
+                if not isinstance(rule, dict) or rule.get("type") not in {"local", "host", "hostssl", "hostnossl"}:
+                    raise ConfigError("postgresql_config.hba[%d].type 无效" % index)
+                fields = ["database", "user", "auth_method"]
+                if rule["type"] != "local":
+                    fields.append("address")
+                for field in fields:
+                    value = rule.get(field)
+                    if not isinstance(value, str) or not value or any(char.isspace() for char in value):
+                        raise ConfigError("postgresql_config.hba[%d].%s 无效" % (index, field))
 
     def _validate(self):
         self._validate_hosts()
