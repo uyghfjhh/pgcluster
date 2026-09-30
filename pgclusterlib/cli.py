@@ -57,6 +57,11 @@ def parser():
     rejoin = sub.add_parser("rejoin")
     rejoin.add_argument("target", help="流复制集群，例如 streaming.basic_cluster")
     rejoin.add_argument("--yes", action="store_true", help="确认重建旧主库数据目录")
+    restore = sub.add_parser("restore")
+    restore.add_argument("target", help="streaming.<集群> 或 mmr.<集群>")
+    restore.add_argument("--yes", action="store_true", help="确认重建角色漂移节点的数据目录")
+    restore.add_argument("--adopt", action="store_true",
+                         help="把配置声明的 PostgreSQL 数据目录纳入 pgcluster 管理（写入 .pgcluster-managed）")
     monitor = sub.add_parser("monitor")
     monitor.add_argument("target", help="实例或集群目标")
     monitor.add_argument("--once", action="store_true", help="只检查一次")
@@ -169,10 +174,12 @@ def main(argv=None):
         if args.command == "verify":
             print(runtime.verify_target(args.target))
             return 0
-        if args.command in {"failover", "switchover", "rejoin"}:
+        if args.command in {"failover", "switchover", "rejoin", "restore"}:
             with configuration_lock(config):
                 if args.command == "rejoin":
                     print(runtime.rejoin(args.target, args.yes))
+                elif args.command == "restore":
+                    print(runtime.restore(args.target, args.yes, getattr(args, "adopt", False)))
                 else:
                     print(runtime.failover(args.target, args.yes, getattr(args, "force", False)))
             return 0
