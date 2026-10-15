@@ -200,6 +200,10 @@ class Runtime:
             for instance in self.config.cluster_instances(stream):
                 if instance not in result:
                     result.append(instance)
+        if kind == "mmr":
+            for instance in self.config.mmr_clusters[name].get("auxiliary_instances", []):
+                if instance not in result:
+                    result.append(instance)
         return result
 
     def status_target(self, target):
@@ -620,6 +624,11 @@ class Runtime:
                      if item["instance"] == name), None)
         return (spec or {}).get("slot") or "%s_%s_slot" % (cluster_name, fallback or name)
 
+    def _replication_host(self, primary, standby):
+        source = self.config.instance(primary)["host_config"]["address"]
+        destination = self.config.instance(standby)["host_config"]["address"]
+        return "127.0.0.1" if source == destination else source
+
     def _rebuild_standby(self, cluster_name, primary, name, slot=None):
         """Rebuild ``name`` as a streaming standby of ``primary`` via basebackup."""
         slot = slot or self._standby_slot(cluster_name, name)
@@ -637,7 +646,7 @@ class Runtime:
             self._psql(primary, "SELECT pg_create_physical_replication_slot(%s)" % quote_literal(slot))
         self._progress("从 %s 重建 %s" % (primary, name))
         self.executor.run(["mkdir", "-p", str(Path(destination["data_dir"]).parent)], host=self._host(destination))
-        self.executor.run([self._bin(name, "pg_basebackup"), "-h", source["host_config"]["address"],
+        self.executor.run([self._bin(name, "pg_basebackup"), "-h", self._replication_host(primary, name),
                            "-p", str(source["port"]), "-U", "postgres", "-D", destination["data_dir"],
                            "-R", "-X", "stream", "-S", slot], host=self._host(destination))
         self.executor.write_text(self._host(destination), self._marker(name),
@@ -715,7 +724,10 @@ class Runtime:
         spec = next((item for item in
                      self.config.streaming_clusters[cluster_name].get("standbys") or []
                      if item["instance"] == name), {})
-        return (parts.get("host") == parent["host_config"]["address"]
+        hosts = {parent["host_config"]["address"]}
+        if self.config.instance(name)["host_config"]["address"] == parent["host_config"]["address"]:
+            hosts.update({"127.0.0.1", "localhost", "::1"})
+        return (parts.get("host") in hosts
                 and parts.get("port") == str(parent["port"])
                 and parts.get("application_name") == (spec.get("application_name") or name))
 
@@ -751,7 +763,7 @@ class Runtime:
                      if item["instance"] == name), {})
         app = spec.get("application_name") or name
         conninfo = "host=%s port=%s user=postgres application_name=%s" % (
-            parent["host_config"]["address"], parent["port"], app)
+            self._replication_host(primary, name), parent["port"], app)
         self._psql(name, "ALTER SYSTEM SET primary_conninfo = %s" % quote_literal(conninfo))
         self._psql(name, "ALTER SYSTEM SET primary_slot_name = %s" % quote_literal(slot))
 
@@ -906,7 +918,7 @@ class Runtime:
         params["listen_addresses"] = "*"
         if primary:
             parent = self.config.instance(primary)
-            params["primary_conninfo"] = "host=%s port=%s user=postgres application_name=%s" % (parent["host_config"]["address"], parent["port"], application_name or name)
+            params["primary_conninfo"] = "host=%s port=%s user=postgres application_name=%s" % (self._replication_host(primary, name), parent["port"], application_name or name)
             params["primary_slot_name"] = slot
         lines = ["# Managed by pgcluster"]
         for key, value in sorted(params.items()):
@@ -1015,7 +1027,7 @@ class Runtime:
             if not self._managed(name):
                 self.executor.run(["mkdir", "-p", str(Path(instance["data_dir"]).parent)], host=host)
                 p = self.config.instance(primary)
-                self.executor.run([self._bin(name, "pg_basebackup"), "-h", p["host_config"]["address"], "-p", str(p["port"]), "-U", "postgres", "-D", instance["data_dir"], "-R", "-X", "stream", "-S", slot], host=host)
+                self.executor.run([self._bin(name, "pg_basebackup"), "-h", self._replication_host(primary, name), "-p", str(p["port"]), "-U", "postgres", "-D", instance["data_dir"], "-R", "-X", "stream", "-S", slot], host=host)
                 self.executor.write_text(host, self._marker(name), json.dumps({"node": name}) + "\n")
             self._write_config(name, primary, slot, extra,
                                standby.get("application_name"))
@@ -1203,6 +1215,16 @@ class Runtime:
         for _, member in members[1:]:
             node = self._primary(member["streaming_cluster"])
             join = member.get("join") or {}
+            if join.get("synchronize_structure") == "data-only":
+                # The engine's probe table must also exist on a data-only joiner.
+                # Business tables remain the caller's responsibility.
+                self._psql(node, "CREATE SCHEMA IF NOT EXISTS pgcluster; "
+                           "CREATE TABLE IF NOT EXISTS pgcluster.mmr_probe "
+                           "(node_name text PRIMARY KEY, token text NOT NULL)", database)
+                self._psql(node,
+                           "CREATE TABLE IF NOT EXISTS fbase_regress_mmr_health ("
+                           "member text PRIMARY KEY, created_at timestamptz NOT NULL DEFAULT clock_timestamp())",
+                           database)
             state = self._psql(
                 node,
                 "SELECT node_state FROM fdd.mmr_node WHERE node_name=%s"

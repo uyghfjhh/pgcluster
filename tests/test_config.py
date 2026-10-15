@@ -79,6 +79,43 @@ class ConfigModelTest(unittest.TestCase):
         with self.assertRaisesRegex(ConfigError, "hba.*address"):
             Config("memory.yaml", raw)
 
+    def test_mmr_only_requires_its_own_extension(self):
+        for extensions in (["fdd_mmr"], ["fdd_mmr", "fb_license"],
+                           ["fbase_mac", "fdd_mmr"]):
+            with self.subTest(extensions=extensions):
+                raw = deepcopy(self.raw)
+                raw["mmr_clusters"]["mmr_cluster"]["extensions"] = extensions
+                Config("memory.yaml", raw).validate("mmr.mmr_cluster")
+
+    def test_mmr_extension_is_required(self):
+        for extensions in ([], ["fbase_mac", "fb_license"], None, "fdd_mmr"):
+            with self.subTest(extensions=extensions):
+                raw = deepcopy(self.raw)
+                raw["mmr_clusters"]["mmr_cluster"]["extensions"] = extensions
+                with self.assertRaisesRegex(ConfigError, "必须包含 fdd_mmr"):
+                    Config("memory.yaml", raw)
+
+    def test_mmr_extension_names_are_validated(self):
+        raw = deepcopy(self.raw)
+        raw["mmr_clusters"]["mmr_cluster"]["extensions"] = ["fdd_mmr", "invalid;extension"]
+        with self.assertRaisesRegex(ConfigError, "不是合法 PostgreSQL 标识符"):
+            Config("memory.yaml", raw)
+
+    def test_mmr_auxiliary_instances_are_managed_without_membership(self):
+        from pgclusterlib.runtime import Runtime
+        raw = deepcopy(self.raw)
+        raw["mmr_clusters"]["mmr_cluster"]["auxiliary_instances"] = ["basic_primary_node"]
+        config = Config("memory.yaml", raw)
+        self.assertIn("basic_primary_node", Runtime(config).target_instances("mmr.mmr_cluster"))
+        self.assertEqual(config.mmr_clusters["mmr_cluster"]["members"], self.raw["mmr_clusters"]["mmr_cluster"]["members"])
+
+    def test_mmr_unknown_auxiliary_instance_is_rejected(self):
+        raw = deepcopy(self.raw)
+        raw["mmr_clusters"]["mmr_cluster"]["auxiliary_instances"] = ["unknown"]
+        with self.assertRaisesRegex(ConfigError, "已声明实例列表"):
+            Config("memory.yaml", raw)
+
+
     def test_duplicate_instance_endpoint_is_rejected(self):
         raw = deepcopy(self.raw)
         raw["instances"]["duplicate_node"] = deepcopy(raw["instances"]["basic_primary_node"])

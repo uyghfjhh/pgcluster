@@ -83,14 +83,14 @@ class ConfigModel:
             if installation.get("provider") not in {"postgres", "fbase"}:
                 raise ConfigError("postgresql_installations.%s.provider 不支持" % name)
             home = installation.get("home")
-            if not isinstance(home, str) or not Path(home).is_absolute():
+            if not isinstance(home, str) or not (Path(home).is_absolute() or home.startswith("/")):
                 raise ConfigError("postgresql_installations.%s.home 必须是绝对路径" % name)
             if installation["provider"] == "fbase":
                 license_config = installation.get("license")
                 if not isinstance(license_config, dict):
                     raise ConfigError("FBase 安装必须配置 license")
                 source = license_config.get("source_file")
-                if not isinstance(source, str) or not Path(source).is_absolute():
+                if not isinstance(source, str) or not (Path(source).is_absolute() or source.startswith("/")):
                     raise ConfigError("postgresql_installations.%s.license.source_file 必须是绝对路径" % name)
                 data_file = license_config.get("data_file", "license.dat")
                 if not isinstance(data_file, str) or not data_file or "/" in data_file:
@@ -103,7 +103,7 @@ class ConfigModel:
                 if "install" in plugin:
                     self._bool(plugin["install"], "安装插件 %s.%s.install" % (name, plugin_name))
                 source = plugin.get("source_dir")
-                if source is not None and (not isinstance(source, str) or not Path(source).is_absolute()):
+                if source is not None and (not isinstance(source, str) or not (Path(source).is_absolute() or source.startswith("/"))):
                     raise ConfigError("安装插件 %s.%s.source_dir 必须是绝对路径" % (name, plugin_name))
                 extension = plugin.get("extension")
                 if extension is not None:
@@ -140,7 +140,7 @@ class ConfigModel:
             if not 1 <= port <= 65535:
                 raise ConfigError("instances.%s.port 超出范围" % name)
             data_dir = instance.get("data_dir")
-            if not isinstance(data_dir, str) or not Path(data_dir).is_absolute() or data_dir == "/":
+            if not isinstance(data_dir, str) or not (Path(data_dir).is_absolute() or data_dir.startswith(("/", "\\"))) or data_dir in {"/", "\\"}:
                 raise ConfigError("instances.%s.data_dir 必须是非根绝对路径" % name)
             endpoint = (self.hosts[host_name]["address"], port)
             location = (self.hosts[host_name]["address"], data_dir)
@@ -235,9 +235,16 @@ class ConfigModel:
             extensions = cluster.get("extensions")
             if not isinstance(extensions, list) or "fdd_mmr" not in extensions:
                 raise ConfigError("mmr_clusters.%s.extensions 必须包含 fdd_mmr" % name)
+            for extension in extensions:
+                self._identifier(extension, "mmr_clusters.%s.extensions" % name)
             members = cluster.get("members")
             if not isinstance(members, dict) or not members:
                 raise ConfigError("mmr_clusters.%s.members 必须是非空对象" % name)
+            auxiliary = cluster.get("auxiliary_instances", [])
+            if (not isinstance(auxiliary, list)
+                    or any(not isinstance(node, str) or node not in self.instances for node in auxiliary)
+                    or len(set(auxiliary)) != len(auxiliary)):
+                raise ConfigError("mmr_clusters.%s.auxiliary_instances 必须是唯一的已声明实例列表" % name)
             for member_name, member in members.items():
                 self._streaming_ref(member.get("streaming_cluster"),
                                     "%s.members.%s.streaming_cluster" % (name, member_name))

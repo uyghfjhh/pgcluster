@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 
 from pgclusterlib.config import load
@@ -93,6 +94,22 @@ class RuntimeInstallTest(unittest.TestCase):
         Runtime(self.config, executor)._init_primary("basic_primary_node")
         self.assertTrue(any(path.endswith("/pgcluster.conf") for path in executor.writes))
         self.assertTrue(any(args[1] == "start" for _, args in executor.commands))
+
+    def test_replication_uses_loopback_only_on_same_database_host(self):
+        nodes = {'primary': {'host_config': {'address': '192.168.1.24'}, 'port': 15432},
+                 'local_standby': {'host_config': {'address': '192.168.1.24'}},
+                 'remote_standby': {'host_config': {'address': '192.168.1.25'}}}
+        config = SimpleNamespace(hosts={}, instance=nodes.__getitem__, streaming_clusters={
+            'group': {'standbys': [{'instance': 'local_standby', 'application_name': 'pg_3'},
+                                  {'instance': 'remote_standby', 'application_name': 'pg_4'}]}})
+        runtime = Runtime(config)
+        self.assertEqual(runtime._replication_host('primary', 'local_standby'), '127.0.0.1')
+        self.assertEqual(runtime._replication_host('primary', 'remote_standby'), '192.168.1.24')
+        runtime._psql = lambda *args, **kwargs: 'host=127.0.0.1 port=15432 application_name=pg_3'
+        self.assertTrue(runtime._upstream_matches('group', 'local_standby', 'primary'))
+        runtime._psql = lambda *args, **kwargs: 'host=127.0.0.1 port=15432 application_name=pg_4'
+        self.assertFalse(runtime._upstream_matches('group', 'remote_standby', 'primary'))
+
 
 if __name__ == "__main__":
     unittest.main()
